@@ -1,0 +1,61 @@
+{
+    "system": "Smart Vertiport Safety Management",
+    "schema_version": "1.0",
+    "timestamp": "2026-10-30T01:22:23.473862+00:00",
+    "simulation": true,
+    "environment": {
+        "person_detected": false,
+        "vehicle_detected": false,
+        "fod_detected": false,
+        "pad_occupied": false
+    },
+    "summary": {
+        "total_drones": 4,
+        "landing_allowed_count": 1,
+        "waiting_count": 3,
+        "restricted_count": 0,
+        "selected_drone": "Drone_C"
+    },
+    "drones": [
+        {
+            "drone_id": "Drone_C",
+            "battery": 45,
+            "emergency": true,
+            "status": "착륙 가능",
+            "reason": "착륙장 안전 조건 충족, 우선순위 1위",
+            "warnings": [
+                "긴급 상태"
+            ],
+            "priority": 1
+        },
+        {
+            "drone_id": "Drone_B",
+            "battery": 15,
+            "emergency": false,
+            "status": "대기",
+            "reason": "상위 우선순위 드론 착륙 대기",
+            "warnings": [
+                "배터리 부족"
+            ],
+            "priority": 2
+        },
+        {
+            "drone_id": "Drone_D",
+            "battery": 60,
+            "emergency": false,
+            "status": "대기",
+            "reason": "상위 우선순위 드론 착륙 대기",
+            "warnings": [],
+            "priority": 3
+        },
+        {
+            "drone_id": "Drone_A",
+            "battery": 80,
+            "emergency": false,
+            "status": "대기",
+            "reason": "상위 우선순위 드론 착륙 대기",
+            "warnings": [],
+            "priority": 4
+        }
+    ]
+}
