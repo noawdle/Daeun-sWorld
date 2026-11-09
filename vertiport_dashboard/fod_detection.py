@@ -24,7 +24,7 @@ def detect(model, photo, threshold):
     return result.plot(), rows, max(scores, default=None)
 
 
-def render_fod_detection(weights, display_timezone):
+def render_fod_detection(weights, display_timezone, check_landing):
     st.subheader("착륙 패드 AI 탐지")
     st.caption("사진 전체에서 학습된 FOD 클래스를 탐지합니다. 패드가 보이는 사진을 사용하세요.")
 
@@ -81,16 +81,96 @@ def render_fod_detection(weights, display_timezone):
         st.image(photo, caption="원본 사진", width="stretch")
         return
 
+    
     _, annotated, rows, top_score, finished_at = output
+
+    # 1. 연동 테스트용 드론 상태
+    st.subheader("드론 상태 및 착륙 판단")
+    st.caption("현재 드론 정보는 가상값입니다. FOD 탐지 결과는 YOLO 모델에서 가져옵니다.")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        battery = st.slider(
+            "드론 배터리 (%)",
+            0, 100, 68,
+            key="fod_demo_battery"
+        )
+
+    with c2:
+        emergency = st.checkbox(
+            "긴급 상태",
+            value=False,
+            key="fod_demo_emergency"
+        )
+
+    # 2. 추가 착륙장 상태 (가상 입력)
+    with st.expander("추가 착륙장 조건 설정 (시뮬레이션)"):
+        person_detected = st.checkbox("사람 탐지 가정", value=False)
+        vehicle_detected = st.checkbox("차량 탐지 가정", value=False)
+        pad_occupied = st.checkbox("착륙장 점유 가정", value=False)
+
+    # 3. 드론 데이터 생성
+    drones = [
+        {
+            "id": "DRONE-01",
+            "battery": battery,
+            "emergency": emergency
+        }
+    ]
+
+    # 4. YOLO FOD 탐지 결과를 판단 알고리즘에 전달
+    vertiport = {
+        "person_detected": person_detected,
+        "vehicle_detected": vehicle_detected,
+        "fod_detected": len(rows) > 0,
+        "pad_occupied": pad_occupied
+    }
+
+    # 5. 실제 착륙 판단 알고리즘 실행
+    result = check_landing(drones[0], vertiport)
+
+    status = result["status"]
+    reason = result["reason"]
+    warnings = result["warnings"]
+
+    # 6. 탐지 및 판단 결과 표시
     count, confidence, decision = st.columns(3)
+
     count.metric("FOD 탐지 수", f"{len(rows)}개")
-    confidence.metric("최고 탐지 신뢰도", f"{top_score:.1%}" if top_score is not None else "—")
-    decision.metric("착륙 판단", "확인 필요")
-    if rows:
-        st.warning("FOD가 감지됐습니다. 탐지 박스를 확인하세요.")
-    else:
-        st.info("설정한 신뢰도 기준에서 탐지된 FOD가 없습니다.")
-    st.caption(f"추론 완료 {finished_at.astimezone(display_timezone):%H:%M:%S} KST · 착륙 판단 및 기체 정보는 JSON 파일 연동 모드에서 확인합니다.")
+
+    confidence.metric(
+        "최고 탐지 신뢰도",
+        f"{top_score:.1%}" if top_score is not None else "—"
+    )
+
+    decision.metric("착륙 판단 (시연)", status)
+
+    # 7. 판단 결과에 따른 경고 표시
+    if status == "접근 제한":
+        st.error(f"접근 제한: {reason}")
+
+    elif status == "대기":
+        st.warning(f"착륙 대기: {reason}")
+
+    elif status == "착륙 가능":
+        st.success(f"시뮬레이션 착륙 가능: {reason}")
+
+    # 8. 드론 경고 표시
+    if warnings:
+        st.warning("기체 경고: " + ", ".join(warnings))
+
+    st.caption(
+        "판단 알고리즘 연동 테스트입니다. "
+        "FOD 이외의 환경 조건과 드론 상태는 가상 입력이며, "
+        "실제 착륙 허가를 의미하지 않습니다."
+    )
+
+    st.caption(
+        f"YOLO 추론 완료: "
+        f"{finished_at.astimezone(display_timezone):%H:%M:%S} KST"
+    )
+
     original, overlay = st.columns(2)
     original.image(photo, caption="원본 사진", width="stretch")
     overlay.image(annotated, channels="BGR", caption="YOLO 탐지 결과", width="stretch")

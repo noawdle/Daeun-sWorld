@@ -1,6 +1,7 @@
 """스마트 버티포트 중간발표용 화면. 실행: python -m streamlit run app.py"""
 import json
 import math
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -8,6 +9,15 @@ import streamlit as st
 from fod_detection import render_fod_detection
 
 ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = ROOT.parent
+
+# 다른 폴더에 있는 착륙 판단 알고리즘 불러오기
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from smart_vertiport.main import check_landing
+
+
 KST = timezone(timedelta(hours=9))
 st.set_page_config(page_title="스마트 버티포트 | FOD 모니터링", page_icon="🛬", layout="wide")
 st.markdown("""<style>
@@ -18,23 +28,56 @@ h1,h2,h3 {color:#14243c;}
 </style>""", unsafe_allow_html=True)
 
 
+
 def demo_data(scenario):
-    """발표용 고정 결과. 실제 착륙 판단 알고리즘이 아님."""
+    """단일 드론 착륙 판단 시뮬레이션."""
+
     fod = scenario == "FOD 발견"
-    multiple = scenario == "복수 기체 요청"
-    aircraft = [dict(id="DRONE-01", battery_pct=68, altitude_m=12.5,
-                     latitude=37.0001, longitude=127.0001, landing_requested=True)]
-    if multiple:
-        aircraft.append(dict(id="DRONE-02", battery_pct=24, altitude_m=18.0,
-                             latitude=37.0003, longitude=127.0002, landing_requested=True))
-    return dict(updated_at=datetime.now(timezone.utc).isoformat(),
-                fod_count=2 if fod else 0, confidence=0.93 if fod else None,
-                decision="BLOCKED" if fod else "ALLOWED",
-                reason="패드 내 FOD 탐지 — 제거 후 재확인" if fod else "샘플 판단 결과: 착륙 가능",
-                aircraft=aircraft,
-                queue=[dict(rank=1, id="DRONE-02", reason="시연용 우선순위") ,
-                       dict(rank=2, id="DRONE-01", reason="시연용 대기 순위")]
-                if multiple else [dict(rank=1, id="DRONE-01", reason="단일 요청")])
+
+    aircraft = [
+        {
+            "id": "DRONE-01",
+            "battery_pct": 68,
+            "altitude_m": 12.5,
+            "latitude": 37.0001,
+            "longitude": 127.0001,
+            "landing_requested": True,
+            "emergency": False
+        }
+    ]
+
+    drone = {
+        "id": aircraft[0]["id"],
+        "battery": aircraft[0]["battery_pct"],
+        "emergency": aircraft[0]["emergency"]
+    }
+
+    vertiport = {
+        "person_detected": False,
+        "vehicle_detected": False,
+        "fod_detected": fod,
+        "pad_occupied": False
+    }
+
+    result = check_landing(drone, vertiport)
+
+    status_map = {
+        "착륙 가능": "ALLOWED",
+        "대기": "WAIT",
+        "접근 제한": "BLOCKED"
+    }
+
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "fod_count": 2 if fod else 0,
+        "confidence": 0.93 if fod else None,
+        "decision": status_map[result["status"]],
+        "reason": result["reason"],
+        "warnings": result["warnings"],
+        "aircraft": aircraft,
+        "queue": []
+    }
+
 
 
 def number(value, lo, hi):
@@ -82,8 +125,7 @@ with st.sidebar:
     st.caption("스마트 버티포트 안전관리")
     source = st.radio("데이터 모드", ["AI FOD 탐지", "시뮬레이션", "JSON 파일 연동"], key="data_mode")
     if source != "AI FOD 탐지":
-        scenario = st.selectbox("시연 상황", ["정상 상태", "FOD 발견", "복수 기체 요청", "수신 중단"],
-                                disabled=source != "시뮬레이션", key="scenario")
+        scenario = st.selectbox( "시연 상황", ["정상 상태", "FOD 발견", "수신 중단"],  disabled=source != "시뮬레이션", key="scenario")
         auto = st.toggle("2초마다 화면 갱신", value=True)
         st.caption("JSON 연동은 data/live_state.json을 읽습니다.")
         st.divider()
@@ -96,11 +138,14 @@ if source == "AI FOD 탐지":
     team_weights = ROOT.parent / "train_model" / "weights" / "best.pt"
     standalone_weights = ROOT / "models" / "best.pt"
     weights = team_weights if team_weights.is_file() else standalone_weights
-    render_fod_detection(weights, KST)
+    render_fod_detection(weights, KST, check_landing)
     st.stop()
 
 if source == "시뮬레이션":
-    st.info("시뮬레이션 데이터로 작동 중입니다. 표시되는 판단·좌표·우선순위는 시연용입니다.")
+    st.info(
+        "시뮬레이션 모드입니다. 드론과 환경 정보는 가상 데이터이며, "
+        "착륙 판단 및 우선순위는 실제 알고리즘으로 계산됩니다."
+    )
 else:
     st.info("외부 JSON 파일 수신 모드입니다. 실제 장비 연결 여부는 데이터를 쓰는 프로그램에서 확인하세요.")
 
@@ -163,13 +208,19 @@ def dashboard():
             st.write("착륙 요청:", "요청 있음" if a['landing_requested'] else "요청 없음")
         else:
             st.info("등록된 기체가 없습니다.")
-        st.subheader("착륙 요청 순위")
+            st.subheader("착륙 요청 순위")
         if data['queue']:
             st.dataframe([{"순위": q['rank'], "기체": q['id'], "사유": q['reason']}
                           for q in sorted(data['queue'], key=lambda q: q['rank'])], hide_index=True, width="stretch")
         else:
             st.caption("대기 중인 요청이 없습니다.")
-        st.caption("외부 알고리즘이 전달한 순위를 표시합니다. 수신 지연 시 순위도 최신 정보가 아닙니다.")
+        if source == "시뮬레이션":
+            st.caption("착륙 우선순위는 판단 알고리즘으로 계산됩니다.")
+        else:
+            st.caption(
+                "외부 알고리즘이 전달한 순위를 표시합니다. "
+                "수신 지연 시 순위도 최신 정보가 아닙니다."
+            )
     with st.expander("현재 수신 데이터 확인"):
         st.json(data)
 
