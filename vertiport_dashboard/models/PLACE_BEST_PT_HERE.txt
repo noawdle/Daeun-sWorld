@@ -1,0 +1,1 @@
+팀에서 학습한 Ultralytics YOLO 객체 탐지 가중치를 이 폴더에 best.pt라는 이름으로 넣으세요.

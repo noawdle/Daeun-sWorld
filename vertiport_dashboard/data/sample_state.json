@@ -1,0 +1,24 @@
+{
+  "updated_at": "2026-10-29T12:00:00+00:00",
+  "fod_count": 0,
+  "confidence": null,
+  "decision": "ALLOWED",
+  "reason": "예시 파일 — 실제 연동 시 최신 데이터로 교체",
+  "aircraft": [
+    {
+      "id": "DRONE-01",
+      "battery_pct": 68,
+      "altitude_m": 12.5,
+      "latitude": 37.0001,
+      "longitude": 127.0001,
+      "landing_requested": true
+    }
+  ],
+  "queue": [
+    {
+      "rank": 1,
+      "id": "DRONE-01",
+      "reason": "단일 요청"
+    }
+  ]
+}

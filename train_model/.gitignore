@@ -1,0 +1,5 @@
+FOD.v1i.yolov11/
+runs/
+*.pt
+!weights/best.pt
+train_log.txt
