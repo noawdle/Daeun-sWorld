@@ -3,13 +3,14 @@
 프로젝트 루트에서 실행:
     python -m streamlit run vertiport_dashboard/app.py
 
-단일 이미지 YOLO 탐지 및 수동 입력을 사용하는 시연용 화면입니다.
+단일 이미지 YOLO 탐지와 사용자 설정/드론 시뮬레이션을 사용하는 시연용 화면입니다.
 실제 비행 허가/자동 착륙 제어에 사용하지 마세요.
 """
 
 import csv
 import math
 import sys
+import time
 from html import escape
 from datetime import timedelta, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ import streamlit as st
 
 from fod_detection import render_fod_detection
 from event_logger import LOG_FILE, load_events, save_event
+from drone_simulator import get_drone_state
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
@@ -27,6 +29,59 @@ if str(PROJECT_ROOT) not in sys.path:
 from smart_vertiport.landing_policy import evaluate_landing
 
 KST = timezone(timedelta(hours=9))
+SIMULATION_SCENARIOS = {
+    "정상 비행": "normal",
+    "배터리 부족": "low_battery",
+    "긴급 상황": "emergency",
+}
+
+SIMULATION_MAX_SECONDS = 120
+
+
+def simulation_elapsed():
+    """시작/일시정지/재개를 반영한 가상 드론 경과 시간 (최대 120초)."""
+    elapsed = float(st.session_state.get("sim_elapsed_base", 0.0))
+    started_at = st.session_state.get("sim_started_at")
+    if st.session_state.get("sim_running", False) and started_at is not None:
+        elapsed += max(0.0, time.monotonic() - started_at)
+    return min(SIMULATION_MAX_SECONDS, max(0.0, elapsed))
+
+
+def start_simulation():
+    """현재 경과 시간에서 재생 시작. 종료 상태면 0초부터 재시작."""
+    if st.session_state.get("sim_running", False):
+        return
+    if simulation_elapsed() >= SIMULATION_MAX_SECONDS:
+        st.session_state["sim_elapsed_base"] = 0.0
+        st.session_state["sim_seek"] = 0
+    st.session_state["sim_started_at"] = time.monotonic()
+    st.session_state["sim_running"] = True
+
+
+def pause_simulation():
+    """현재 시각을 저장하고 일시정지."""
+    elapsed = simulation_elapsed()
+    st.session_state["sim_elapsed_base"] = elapsed
+    st.session_state["sim_started_at"] = None
+    st.session_state["sim_running"] = False
+    st.session_state["sim_seek"] = int(elapsed)
+
+
+def reset_simulation():
+    """0초로 초기화. 시나리오 변경 시에도 사용."""
+    st.session_state["sim_elapsed_base"] = 0.0
+    st.session_state["sim_started_at"] = None
+    st.session_state["sim_running"] = False
+    st.session_state["sim_seek"] = 0
+
+
+def seek_simulation():
+    """정지 중에 슬라이더로 시간을 직접 지정."""
+    st.session_state["sim_elapsed_base"] = float(st.session_state["sim_seek"])
+    st.session_state["sim_started_at"] = None
+    st.session_state["sim_running"] = False
+
+
 
 
 def validate_landing_inputs(drone, vertiport, detection):
@@ -147,7 +202,7 @@ def render_status_card(status):
     )
 
 
-def render_condition_chips(detection, pad_occupied, emergency):
+def render_condition_chips(detection, pad_occupied, emergency, data_source):
     """현재 판단에 사용되는 핵심 입력을 시각적으로 요약합니다."""
     if detection is None:
         fod_label, fod_tone = "FOD · 유효 결과 없음", "neutral"
@@ -156,9 +211,13 @@ def render_condition_chips(detection, pad_occupied, emergency):
     else:
         fod_label, fod_tone = "FOD · 사진에서 미탐지", "success"
 
-    pad_label = "착륙장 · 점유" if pad_occupied else "착륙장 · 미점유 (수동)"
+    pad_label = "착륙장 · 점유" if pad_occupied else "착륙장 · 미점유 (설정값)"
     pad_tone = "warning" if pad_occupied else "neutral"
-    emergency_label = "긴급 상태 · 입력됨" if emergency else "긴급 상태 · 없음 (수동)"
+    input_type = "시뮬레이션 데이터" if data_source == "simulation" else "직접 설정"
+    emergency_label = (
+        f"긴급 상태 · 발생 ({input_type})" if emergency
+        else f"긴급 상태 · 없음 ({input_type})"
+    )
     emergency_tone = "danger" if emergency else "neutral"
 
     chips = ((fod_label, fod_tone), (pad_label, pad_tone),
@@ -220,33 +279,97 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+@st.fragment(run_every="1s")
+def render_simulation_clock(scenario):
+    """사이드바의 시계만 1초마다 갱신하고 YOLO 재추론은 하지 않음."""
+    elapsed = simulation_elapsed()
+    status = "진행 중" if st.session_state.get("sim_running") else "일시정지 / 대기"
+    if elapsed >= SIMULATION_MAX_SECONDS:
+        status = "120초 시연 종료"
+    st.metric("시뮬레이션 경과 시간", f"{int(elapsed)}초")
+    state = get_drone_state(elapsed, scenario=scenario)
+    st.caption(f"{status} · {state['flight_phase']} · 배터리 {state['battery']}% / 고도 {state['altitude_m']:g}m")
+
+
+# 시뮬레이션 상태는 세션별로 저장됩니다 (서버 전체 공용 상태 아님).
+for key, default in (
+    ("sim_elapsed_base", 0.0),
+    ("sim_started_at", None),
+    ("sim_running", False),
+    ("sim_seek", 0),
+):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
 with st.sidebar:
     st.title("🛬 VERTIPORT")
     st.caption("단일 드론 안전관리 · 시뮬레이션")
     st.divider()
 
-    st.subheader("드론 상태 (수동 입력)")
-    drone_id = "DRONE-01"
-    battery = st.slider("배터리 (%)", 0, 100, 68)
-    emergency = st.checkbox("긴급 상태", value=False)
-    landing_requested = st.checkbox("착륙 요청", value=True)
-    altitude_m = st.number_input(
-        "고도 (m, 시뮬레이션)", min_value=0.0, max_value=100000.0,
-        value=12.5, step=0.5,
+    st.subheader("드론 상태 설정")
+    input_mode = st.radio(
+        "드론 정보 방식", ["직접 설정", "드론 시뮬레이션"],
+        horizontal=False,
+        on_change=reset_simulation,
     )
+    if input_mode == "직접 설정":
+        data_source = "manual"
+        manual_battery = st.slider("배터리 (%)", 0, 100, 68)
+        manual_emergency = st.checkbox("긴급 상태", value=False)
+        manual_landing_requested = st.checkbox("착륙 요청", value=True)
+        manual_altitude = st.number_input(
+            "고도 (m, 시뮬레이션)", min_value=0.0, max_value=100000.0,
+            value=12.5, step=0.5,
+        )
+    else:
+        data_source = "simulation"
+        scenario_label = st.selectbox(
+            "시뮬레이션 시나리오", list(SIMULATION_SCENARIOS),
+            on_change=reset_simulation,
+        )
+        col_start, col_pause, col_reset = st.columns(3)
+        with col_start:
+            st.button(
+                "▶ 시작", on_click=start_simulation,
+                disabled=st.session_state["sim_running"],
+                use_container_width=True,
+            )
+        with col_pause:
+            st.button(
+                "⏸ 정지", on_click=pause_simulation,
+                disabled=not st.session_state["sim_running"],
+                use_container_width=True,
+            )
+        with col_reset:
+            st.button("↺ 초기화", on_click=reset_simulation, use_container_width=True)
+
+        if not st.session_state["sim_running"]:
+            st.slider(
+                "경과 시간 직접 조절 (초)", 0, SIMULATION_MAX_SECONDS,
+                key="sim_seek", on_change=seek_simulation,
+            )
+        else:
+            st.caption("진행 중에는 시간 슬라이더가 숨겨집니다. 일시정지 후 직접 조절할 수 있습니다.")
+
+        render_simulation_clock(SIMULATION_SCENARIOS[scenario_label])
+        st.caption(
+            "실제 기체와 통신하지 않습니다. 시작 버튼을 누르면 가상 시간이 흐르며 "
+            "상단 상태 정보는 약 5초마다 갱신됩니다."
+        )
 
     st.divider()
-    st.subheader("추가 환경 조건 (수동 입력)")
-    person_detected = st.checkbox("사람 있음 (가정)", value=False)
-    vehicle_detected = st.checkbox("차량 있음 (가정)", value=False)
+    st.subheader("착륙장 조건 설정")
+    person_detected = st.checkbox("사람 있음", value=False)
+    vehicle_detected = st.checkbox("차량 있음", value=False)
     pad_occupied = st.checkbox("착륙장 점유 중", value=False)
     st.caption("FOD 여부는 사진의 YOLO 탐지 결과로만 결정합니다.")
 
 st.title("스마트 버티포트 통합 모니터링")
 st.caption("YOLO FOD 탐지 · 단일 드론 상태 · 착륙 판단 알고리즘")
 st.info(
-    "연동 시연용 화면입니다. 드론·추가 환경 조건은 수동 입력이며, "
-    "YOLO 결과는 업로드/촬영한 정지 이미지 기준입니다. 실제 착륙 허가가 아닙니다."
+    "시뮬레이션 전용 화면입니다. 드론 상태는 직접 설정하거나 프로그램에서 생성하며, "
+    "착륙장 조건은 직접 선택합니다. YOLO는 정지 이미지만 분석합니다. "
+    "실제 드론 통신이나 착륙 허가가 아닙니다."
 )
 
 team_weights = PROJECT_ROOT / "train_model" / "weights" / "best.pt"
@@ -258,6 +381,28 @@ weights = team_weights if team_weights.is_file() else standalone_weights
 # 기존과 동일하게 5초마다 결과 유효시간을 재검사합니다.
 @st.fragment(run_every="5s")
 def monitoring_panel():
+    # fragment가 갱신될 때마다 가상 시간을 재계산합니다.
+    # 전역 변수로 최초 1회 계산하면 시간이 흘러도 값이 바뀌지 않습니다.
+    if data_source == "simulation":
+        simulated = get_drone_state(
+            simulation_elapsed(), scenario=SIMULATION_SCENARIOS[scenario_label]
+        )
+        drone_id = simulated["id"]
+        battery = simulated["battery"]
+        altitude_m = simulated["altitude_m"]
+        emergency = simulated["emergency"]
+        landing_requested = simulated["landing_requested"]
+        flight_phase = simulated["flight_phase"]
+        time_label = f" · 경과 시간: {simulated['elapsed_seconds']}초"
+    else:
+        drone_id = "DRONE-01"
+        battery = manual_battery
+        altitude_m = manual_altitude
+        emergency = manual_emergency
+        landing_requested = manual_landing_requested
+        flight_phase = "직접 설정"
+        time_label = ""
+
     # 이 영역을 먼저 확보해 두면 FOD 분석 후 계산한 판단 상태를
     # 화면 맨 위에 요약 카드로 보여줄 수 있습니다.
     summary_slot = st.empty()
@@ -272,12 +417,16 @@ def monitoring_panel():
     record_fod_analysis(detection, drone_id, battery)
 
     # 기존 입력 검증, 착륙 판단 및 이벤트 기록 기준을 변경하지 않습니다.
-    outcome = evaluate_current_state(detection)
+    outcome = evaluate_current_state(
+        detection, drone_id, battery, emergency, landing_requested,
+        person_detected, vehicle_detected, pad_occupied,
+    )
 
     with summary_slot.container():
         st.markdown('<div class="top-summary-title">종합 모니터링 현황</div>',
                     unsafe_allow_html=True)
-        st.caption(f"{drone_id} · 단일 드론 · 수동 입력 시뮬레이션")
+        source_label = "드론 시뮬레이션 데이터" if data_source == "simulation" else "직접 설정 데이터"
+        st.caption(f"{drone_id} · 단일 드론 · {source_label} · 비행 단계: {flight_phase}{time_label}")
         col_status, col_battery, col_altitude, col_fod = st.columns(
             [2.0, 1, 1, 1], gap="small"
         )
@@ -291,14 +440,14 @@ def monitoring_panel():
             st.metric("FOD 탐지", "미확인" if detection is None
                       else f'{detection["fod_count"]}개')
         st.caption(
-            "FOD는 업로드/촬영한 정지 이미지 기준이며, 배터리·고도·착륙장 정보는 수동 입력입니다. "
-            "이 화면의 판단은 실제 착륙 허가가 아닙니다."
+            f"FOD는 정지 이미지 기준이며, 배터리·고도는 {source_label}입니다. "
+            "착륙장 조건은 직접 선택한 값입니다. 실제 착륙 허가가 아닙니다."
         )
 
     with col_decision:
         st.subheader("판단 근거 및 권고 조치")
         st.caption("현재 기체 상태와 착륙장 조건을 종합해 판단합니다.")
-        render_condition_chips(detection, pad_occupied, emergency)
+        render_condition_chips(detection, pad_occupied, emergency, data_source)
 
         if outcome["message_kind"] == "error":
             st.error(outcome["message"])
@@ -314,7 +463,7 @@ def monitoring_panel():
         st.write("기체 경고 수준:", outcome["alert_level"])
         st.info("권고 조치: " + outcome["recommended_action"])
         st.caption(
-            "판단 기준: FOD 탐지 및 수동 입력한 환경·기체 조건. "
+            "판단 기준: FOD 탐지 및 환경 조건·기체 상태 데이터. "
             "배터리 부족·긴급 상태는 팀 알고리즘에서 경고 조건입니다."
         )
         if outcome["debug"] is not None:
@@ -335,7 +484,7 @@ def monitoring_panel():
             st.dataframe(recent, hide_index=True, width="stretch", height=305)
             with st.expander("이전 이벤트 기록 30건 보기"):
                 st.dataframe(load_events(limit=30), hide_index=True, width="stretch")
-                st.caption("수동 테스트 기록도 포함될 수 있습니다.")
+                st.caption("직접 실행한 테스트 기록도 포함될 수 있습니다.")
             st.download_button(
                 "전체 이벤트 CSV 다운로드",
                 data=LOG_FILE.read_bytes(),
@@ -349,8 +498,10 @@ def monitoring_panel():
         st.warning(f"이벤트 기록 불러오기 실패: {error}")
 
 
-def evaluate_current_state(detection):
-    """기존 STEP 5-3의 분기·기록 방식 그대로 반환값만 화면용으로 묶습니다."""
+def evaluate_current_state(detection, drone_id, battery, emergency,
+                           landing_requested, person_detected, vehicle_detected,
+                           pad_occupied):
+    """직접 설정/시뮬레이션 데이터에 동일한 판단 규칙을 적용합니다."""
     if detection is None:
         record_decision_change(
             "판단 확인 필요", "유효한 FOD 탐지 결과 없음 또는 유효시간 만료",
