@@ -7,6 +7,10 @@ from io import BytesIO
 import streamlit as st
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+# 시연용: 분석 완료 후 60초가 지나면 결과를 더 이상 착륙 판단에 사용하지 않습니다.
+# 주의: 사진 자체의 촬영 시각을 검증하는 기능은 아닙니다.
+MAX_RESULT_AGE_SECONDS = 60
+
 
 def detect(model, photo, threshold):
     """주석 표시된 BGR 이미지, 탐지 표의 행, 최고 신뢰도를 반환합니다."""
@@ -25,11 +29,12 @@ def detect(model, photo, threshold):
 
 
 def render_fod_detection(weights, display_timezone):
-    """탐지 화면을 표시하고, 최신 유효 분석 결과가 있으면 요약 dict 반환."""
+    """탐지 화면을 표시하고, 유효시간 내 분석 결과가 있으면 요약 dict 반환."""
     st.subheader("착륙 패드 AI FOD 탐지")
     st.caption("사진 업로드 또는 웹캠 촬영 후 'FOD 탐지 실행'을 눌러주세요.")
 
     if not weights.is_file():
+        st.session_state.pop("fod_output", None)
         st.error("YOLO 가중치 best.pt 파일을 찾지 못했습니다.")
         st.code(
             "train_model/weights/best.pt  (팀 저장소)\n"
@@ -61,6 +66,7 @@ def render_fod_detection(weights, display_timezone):
         with Image.open(BytesIO(payload)) as image:
             photo = ImageOps.exif_transpose(image).convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+        st.session_state.pop("fod_output", None)
         st.error("이미지를 열 수 없습니다. 유효한 JPG/PNG를 선택해 주세요.")
         return None
 
@@ -84,6 +90,7 @@ def render_fod_detection(weights, display_timezone):
                     datetime.now(timezone.utc),
                 )
             except Exception as error:
+                st.session_state.pop("fod_output", None)
                 st.error(f"YOLO 탐지 실행 실패: {error}")
                 return None
 
@@ -94,6 +101,23 @@ def render_fod_detection(weights, display_timezone):
         return None
 
     _, annotated, rows, top_score, finished_at = output
+
+    # 기존 결과가 오래되었거나 시각이 잘못되면 반드시 판단 보류.
+    if not isinstance(finished_at, datetime) or finished_at.tzinfo is None:
+        st.session_state.pop("fod_output", None)
+        st.warning("분석 시각을 확인할 수 없습니다. FOD 탐지를 다시 실행해 주세요.")
+        return None
+
+    age_seconds = (datetime.now(timezone.utc) - finished_at).total_seconds()
+    if not -5 <= age_seconds <= MAX_RESULT_AGE_SECONDS:
+        st.session_state.pop("fod_output", None)
+        st.warning(
+            f"FOD 분석 결과가 유효하지 않습니다(유효시간: {MAX_RESULT_AGE_SECONDS}초). "
+            "현재 사진으로 다시 탐지해 주세요."
+        )
+        st.image(photo, caption="재분석이 필요한 사진", width="stretch")
+        return None
+
     count_col, score_col = st.columns(2)
     count_col.metric("YOLO 탐지 수", f"{len(rows)}개")
     score_col.metric(
@@ -110,7 +134,14 @@ def render_fod_detection(weights, display_timezone):
     overlay.image(annotated, channels="BGR", caption="YOLO 탐지 결과", width="stretch")
     if rows:
         st.dataframe(rows, hide_index=True, width="stretch")
-    st.caption(f"분석 시각: {finished_at.astimezone(display_timezone):%Y-%m-%d %H:%M:%S} KST")
+    st.caption(
+        f"분석 시각: {finished_at.astimezone(display_timezone):%Y-%m-%d %H:%M:%S} KST"
+        f" · 분석 결과 유효시간: {MAX_RESULT_AGE_SECONDS}초"
+    )
 
     # 주의: 팀 YOLO 모델이 FOD만 학습했다는 전제. 클래스가 혼합되면 필터 추가 필요.
-    return {"fod_detected": len(rows) > 0, "fod_count": len(rows), "confidence": top_score}
+    return {
+        "fod_detected": len(rows) > 0,
+        "fod_count": len(rows),
+        "confidence": top_score,
+    }
