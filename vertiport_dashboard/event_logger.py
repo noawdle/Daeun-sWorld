@@ -22,7 +22,7 @@ _DECISION_DUPLICATE_WINDOW_SECONDS = 3
 
 
 def _recent_duplicate(log_path, event, now):
-    """같은 착륙 판단이 직전 3초 내 저장됐는지 확인합니다."""
+    """같은 기체의 직전 판단이 3초 내 중복 기록인지 확인합니다."""
     if event["이벤트"] != "착륙 판단 변경" or not log_path.exists():
         return False
     with log_path.open("r", newline="", encoding="utf-8-sig") as file:
@@ -30,15 +30,16 @@ def _recent_duplicate(log_path, event, now):
 
     fields = ["이벤트", "드론 ID", "FOD 개수", "배터리 (%)", "착륙 판단", "상세 내용"]
     for prior in reversed(recent):
-        if not all(str(prior.get(field, "")) == str(event[field]) for field in fields):
+        if prior.get("이벤트") != event["이벤트"] or prior.get("드론 ID") != event["드론 ID"]:
             continue
+        if not all(str(prior.get(field, "")) == str(event[field]) for field in fields):
+            return False
         try:
             prior_at = datetime.strptime(prior["시간"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
         except (KeyError, TypeError, ValueError):
-            continue
+            return False
         age = (now - prior_at).total_seconds()
-        if 0 <= age <= _DECISION_DUPLICATE_WINDOW_SECONDS:
-            return True
+        return 0 <= age <= _DECISION_DUPLICATE_WINDOW_SECONDS
     return False
 
 
