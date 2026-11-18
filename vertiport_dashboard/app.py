@@ -3,7 +3,7 @@
 프로젝트 루트에서 실행:
     python -m streamlit run vertiport_dashboard/app.py
 
-단일 이미지 YOLO 탐지와 사용자 설정/드론 시뮬레이션을 사용하는 시연용 화면입니다.
+이미지·실시간 영상 YOLO 탐지와 드론 시뮬레이션을 사용하는 시연용 화면입니다.
 실제 비행 허가/자동 착륙 제어에 사용하지 마세요.
 """
 
@@ -17,9 +17,10 @@ from pathlib import Path
 
 import streamlit as st
 
-from fod_detection import render_fod_detection
+from fod_detection import get_model, model_identity, render_fod_detection
 from event_logger import LOG_FILE, load_events, save_event
 from drone_simulator import get_drone_state
+from video_detection import VIDEO_IDLE, VIDEO_STOPPED, VideoAnalysis
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
@@ -121,33 +122,30 @@ def validate_landing_inputs(drone, vertiport, detection):
         raise ValueError("YOLO 탐지 신뢰도 오류")
 
 
-def record_fod_analysis(detection, drone_id, battery):
-    """새 YOLO 분석 1회당 이벤트를 1회만 기록합니다."""
-    if detection is None:
+def record_fod_state(detection, drone_id, battery, mode, unavailable_reason):
+    """영상은 탐지 여부가 바뀔 때, 이미지는 새 분석도 기록합니다."""
+    count = detection["fod_count"] if detection is not None else None
+    state = None if count is None else count > 0
+    output = st.session_state.get("fod_output") if mode == "이미지 업로드" else None
+    analysis_time = output[4] if output is not None and detection is not None else None
+    event_key = (mode, state, analysis_time)
+    previous = st.session_state.get("last_logged_fod_state")
+    if previous == event_key or (previous is None and state is None):
         return
 
-    output = st.session_state.get("fod_output")
-    if not isinstance(output, tuple) or len(output) != 5:
-        return
-
-    # result_key + 분석 완료 시각으로 새 분석과 5초 화면 갱신을 구분.
-    analysis_key = (output[0], output[4])
-    if st.session_state.get("last_logged_fod_analysis") == analysis_key:
-        return
-
-    fod_count = detection["fod_count"]
+    details = unavailable_reason if count is None else f"YOLO 분석 완료 · FOD {count}개"
     try:
         save_event(
-            "FOD 분석",
+            "FOD 분석" if analysis_time is not None else "FOD 상태 변경",
             drone_id=drone_id,
-            fod_count=fod_count,
+            fod_count=count,
             battery=battery,
-            description=f"YOLO 분석 완료: FOD {fod_count}개",
+            description=f"{mode} · {details}",
         )
     except OSError as error:
         st.warning(f"이벤트 기록 파일 저장 실패: {error}")
     else:
-        st.session_state["last_logged_fod_analysis"] = analysis_key
+        st.session_state["last_logged_fod_state"] = event_key
 
 
 def record_decision_change(status, reason, drone_id, battery, detection=None,
@@ -209,7 +207,7 @@ def render_condition_chips(detection, pad_occupied, emergency, data_source):
     elif detection["fod_detected"]:
         fod_label, fod_tone = f'FOD · {detection["fod_count"]}개 탐지', "danger"
     else:
-        fod_label, fod_tone = "FOD · 사진에서 미탐지", "success"
+        fod_label, fod_tone = "FOD · 미탐지", "success"
 
     pad_label = "착륙장 · 점유" if pad_occupied else "착륙장 · 미점유 (설정값)"
     pad_tone = "warning" if pad_occupied else "neutral"
@@ -354,7 +352,7 @@ with st.sidebar:
         render_simulation_clock(SIMULATION_SCENARIOS[scenario_label])
         st.caption(
             "실제 기체와 통신하지 않습니다. 시작 버튼을 누르면 가상 시간이 흐르며 "
-            "상단 상태 정보는 약 5초마다 갱신됩니다."
+            "상단 상태 정보는 약 1초마다 갱신됩니다."
         )
 
     st.divider()
@@ -362,13 +360,13 @@ with st.sidebar:
     person_detected = st.checkbox("사람 있음", value=False)
     vehicle_detected = st.checkbox("차량 있음", value=False)
     pad_occupied = st.checkbox("착륙장 점유 중", value=False)
-    st.caption("FOD 여부는 사진의 YOLO 탐지 결과로만 결정합니다.")
+    st.caption("FOD 여부는 선택한 입력의 YOLO 탐지 결과로 결정합니다.")
 
 st.title("스마트 버티포트 통합 모니터링")
 st.caption("YOLO FOD 탐지 · 단일 드론 상태 · 착륙 판단 알고리즘")
 st.info(
     "시뮬레이션 전용 화면입니다. 드론 상태는 직접 설정하거나 프로그램에서 생성하며, "
-    "착륙장 조건은 직접 선택합니다. YOLO는 정지 이미지만 분석합니다. "
+    "사람·차량·착륙장 점유는 직접 설정합니다. "
     "실제 드론 통신이나 착륙 허가가 아닙니다."
 )
 
@@ -377,9 +375,66 @@ standalone_weights = ROOT / "models" / "best.pt"
 weights = team_weights if team_weights.is_file() else standalone_weights
 
 
-# STEP 5-4: YOLO/판단/기록 로직은 유지하고 화면 순서만 재배치합니다.
-# 기존과 동일하게 5초마다 결과 유효시간을 재검사합니다.
-@st.fragment(run_every="5s")
+def reset_detection_mode():
+    st.session_state.pop("fod_output", None)
+    st.session_state.pop("fod_error", None)
+    context = st.session_state.pop("active_fod_video", None)
+    if context is not None and context.video_processor is not None:
+        context.video_processor.on_ended()
+    st.session_state.pop("fod_video_was_playing", None)
+
+
+def render_video_stream():
+    """연결 컴포넌트는 폴링 fragment 밖에서 렌더링합니다."""
+    st.subheader("착륙 패드 실시간 영상 분석")
+    st.caption("START로 카메라 연결, STOP으로 분석을 종료합니다. 카메라 권한을 허용해 주세요.")
+    try:
+        from streamlit_webrtc import WebRtcMode, webrtc_streamer
+    except ImportError:
+        return None, "영상 분석 패키지를 불러오지 못했습니다. requirements.txt를 설치해 주세요."
+
+    if not weights.is_file():
+        return None, f"YOLO 가중치를 찾지 못했습니다. 경로 · {weights}"
+    model = get_model(model_identity(weights))
+    st.caption(f"사용 모델 · {weights.parent.name}/{weights.name}")
+    with st.expander("영상 분석 설정"):
+        threshold = st.slider("최소 탐지 신뢰도", 0.05, 0.95, 0.25, 0.05, key="video_threshold")
+        interval = st.number_input("분석 간격 (초)", 0.2, 5.0, 0.5, 0.1)
+        image_size = st.selectbox("YOLO 입력 크기", [320, 480, 640], index=2)
+        max_age = st.number_input("결과 및 프레임 유효시간 (초)", 1.0, 20.0, 3.0, 0.5)
+    if max_age <= interval:
+        st.warning("분석 간격보다 유효시간을 길게 설정하면 분석 사이의 판단 보류를 줄일 수 있습니다.")
+    settings = (model, threshold, interval, image_size, max_age)
+    context = webrtc_streamer(
+        key="fod_video_stream",
+        mode=WebRtcMode.SENDRECV,
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=lambda: VideoAnalysis(*settings),
+        async_processing=False,
+    )
+    st.session_state["active_fod_video"] = context
+    processor = context.video_processor
+    if processor is not None:
+        processor.configure(settings)
+    if context.state.playing:
+        st.session_state["fod_video_was_playing"] = True
+        return processor, "카메라 프레임을 기다리는 중입니다."
+    if context.state.signalling:
+        return None, "카메라 연결 중입니다. 브라우저의 카메라 권한을 확인해 주세요."
+    if st.session_state.get("fod_video_was_playing"):
+        return None, VIDEO_STOPPED
+    return None, VIDEO_IDLE
+
+
+detection_mode = st.radio(
+    "FOD 탐지 모드", ["이미지 업로드", "실시간 영상 분석"],
+    horizontal=True, on_change=reset_detection_mode,
+)
+if detection_mode == "실시간 영상 분석":
+    video_processor, video_reason = render_video_stream()
+
+
+@st.fragment(run_every="1s")
 def monitoring_panel():
     # fragment가 갱신될 때마다 가상 시간을 재계산합니다.
     # 전역 변수로 최초 1회 계산하면 시간이 흘러도 값이 바뀌지 않습니다.
@@ -411,15 +466,30 @@ def monitoring_panel():
     col_detect, col_decision = st.columns([1.25, 1], gap="large")
 
     with col_detect:
-        detection = render_fod_detection(weights, KST)
+        if detection_mode == "이미지 업로드":
+            detection = render_fod_detection(weights, KST)
+            unavailable_reason = (
+                "YOLO 이미지 추론에 실패했습니다." if "fod_error" in st.session_state
+                else "유효한 이미지 분석 결과가 없습니다."
+            )
+        else:
+            st.subheader("실시간 FOD 탐지 결과")
+            detection, unavailable_reason = (
+                video_processor.snapshot() if video_processor is not None else (None, video_reason)
+            )
+            if detection is None:
+                st.info(unavailable_reason)
+            else:
+                count_col, score_col = st.columns(2)
+                count_col.metric("FOD 탐지 수", f'{detection["fod_count"]}개')
+                score = detection["confidence"]
+                score_col.metric("최고 탐지 신뢰도", "—" if score is None else f"{score:.1%}")
 
-    # 각 YOLO 실행은 1번만 기록하고, 분석 버튼 이외의 5초 갱신은 제외합니다.
-    record_fod_analysis(detection, drone_id, battery)
+    record_fod_state(detection, drone_id, battery, detection_mode, unavailable_reason)
 
-    # 기존 입력 검증, 착륙 판단 및 이벤트 기록 기준을 변경하지 않습니다.
     outcome = evaluate_current_state(
         detection, drone_id, battery, emergency, landing_requested,
-        person_detected, vehicle_detected, pad_occupied,
+        person_detected, vehicle_detected, pad_occupied, unavailable_reason,
     )
 
     with summary_slot.container():
@@ -440,7 +510,7 @@ def monitoring_panel():
             st.metric("FOD 탐지", "미확인" if detection is None
                       else f'{detection["fod_count"]}개')
         st.caption(
-            f"FOD는 정지 이미지 기준이며, 배터리·고도는 {source_label}입니다. "
+            f"FOD 입력은 {detection_mode}이며, 배터리·고도는 {source_label}입니다. "
             "착륙장 조건은 직접 선택한 값입니다. 실제 착륙 허가가 아닙니다."
         )
 
@@ -477,7 +547,7 @@ def monitoring_panel():
     with col_title:
         st.subheader("최근 이벤트 기록")
     with col_info:
-        st.caption("새 FOD 분석 · 판단 변경 · 결과 만료 시 자동 기록")
+        st.caption("이미지 분석 · FOD 상태 변경 · 착륙 판단 변경 자동 기록")
     try:
         recent = load_events(limit=8)
         if recent:
@@ -500,20 +570,20 @@ def monitoring_panel():
 
 def evaluate_current_state(detection, drone_id, battery, emergency,
                            landing_requested, person_detected, vehicle_detected,
-                           pad_occupied):
+                           pad_occupied, unavailable_reason="유효한 FOD 탐지 결과가 없습니다."):
     """직접 설정/시뮬레이션 데이터에 동일한 판단 규칙을 적용합니다."""
     if detection is None:
         record_decision_change(
-            "판단 확인 필요", "유효한 FOD 탐지 결과 없음 또는 유효시간 만료",
+            "판단 확인 필요", unavailable_reason,
             drone_id, battery,
         )
         return {
             "status": "판단 확인 필요",
             "message_kind": "warning",
-            "message": "유효한 FOD 탐지 결과가 없습니다. 사진을 다시 분석해 주세요.",
+            "message": unavailable_reason,
             "warnings": [],
             "alert_level": "판단 보류",
-            "recommended_action": "사진을 재분석하여 유효한 FOD 탐지 결과 확보",
+            "recommended_action": "현재 FOD 입력을 확인하고 최신 분석 결과 확보",
             "debug": None,
         }
 
@@ -596,5 +666,5 @@ monitoring_panel()
 st.caption(
     "주의: YOLO 모델은 FOD 클래스만 학습한 모델을 사용합니다. "
     "다른 객체 탐지를 수행하지 않으며, 미탐지 결과가 실제 착륙장 안전을 보장하지는 않습니다. "
-    "결과 유효시간은 분석 완료 시각 기준이며 사진 촬영 시각을 보증하지 않습니다."
+    "이미지 분석 완료 시각으로 사진 촬영 시각을 확인할 수 없습니다."
 )
