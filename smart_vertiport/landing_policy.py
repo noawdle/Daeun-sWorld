@@ -49,3 +49,27 @@ def evaluate_landing(drone, vertiport):
     result["recommended_action"] = action
 
     return result
+
+
+def evaluate_fod_landing(detection, *, pad_confirmed, telemetry_ready, communication_ready,
+                         battery, emergency, unavailable_reason="최신 카메라 분석이 필요합니다."):
+    """단일 기체 관제용 판단. 호출자는 현재 연결의 유효한 분석만 전달합니다."""
+    alert = "긴급" if emergency else "주의" if battery is not None and battery < 20 else "정상"
+    count = detection.get("fod_count") if detection is not None else None
+    if detection is None:
+        status, reason = "HOLD", unavailable_reason
+    elif type(count) is not int or count < 0:
+        status, reason = "HOLD", "FOD 탐지 개수를 확인할 수 없습니다."
+    elif count > 0:
+        status, reason = "UNSAFE", f"착륙 구역 FOD {count}개 탐지"
+    else:
+        pending = [
+            label for passed, label in (
+                (pad_confirmed, "패드 확인"), (telemetry_ready, "기체 상태"),
+                (communication_ready, "통신 상태"), (alert == "정상", "기체 경고 해소"),
+            ) if not passed
+        ]
+        status = "HOLD" if pending else "SAFE"
+        reason = ("FOD 0개 · 확인 필요: " + ", ".join(pending) if pending
+                  else "최신 FOD 미탐지 및 착륙 사전조건 충족")
+    return {"status": status, "reason": reason, "alert_level": alert}

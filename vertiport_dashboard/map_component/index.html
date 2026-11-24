@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>버티포트 디지털 트윈</title>
+<style>
+body { margin: 0; background: #0c1728; color: #dce8fa; font: 13px system-ui; }
+main { overflow: hidden; border: 1px solid #2b425f; border-radius: 10px; }
+header, nav { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 8px; }
+header { justify-content: space-between; border-bottom: 1px solid #2b425f; }
+button { background: #13263e; color: #dce8fa; border: 1px solid #365475; border-radius: 5px; padding: 5px 7px; cursor: pointer; font: 600 11px system-ui; }
+button[aria-pressed="true"] { background: #234d78; border-color: #87bfff; }
+button:disabled { opacity: .5; cursor: default; }
+#scene { height: clamp(300px, 33vw, 460px); position: relative; }
+#scene canvas, #map2d { display: block; width: 100%; cursor: crosshair; }
+#scene canvas { height: 100%; }
+#map2d { height: auto; }
+[hidden] { display: none !important; }
+.twin-status { display: grid; grid-template-columns: repeat(auto-fit,minmax(148px,1fr)); gap: 6px; padding: 8px; border-top: 1px solid #304967; }
+.twin-status div { background: #10233f; border: 1px solid #304967; border-radius: 8px; padding: 6px 8px; min-width: 0; }
+.twin-status small { display: block; color: #cbd5e1; font-size: 11px; font-weight: 500; }
+.twin-status strong { display: block; color: #fff; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
+.twin-status small span { color: #afc0d4; }
+.twin-status #safety[data-state="SAFE"] { color: #22c55e; }
+.twin-status #safety[data-state="HOLD"] { color: #fbbf24; }
+.twin-status #safety[data-state="UNSAFE"] { color: #f87171; }
+p { margin: 0; padding: 7px 8px; }
+</style>
+<script type="importmap">
+{"imports":{"three":"./vendor/three-0.180.0/build/three.module.min.js"}}
+</script>
+<main>
+<header><strong>버티포트 디지털 트윈</strong><div>
+<button id="show3d" aria-pressed="true">3D</button> <button id="show2d" aria-pressed="false">2D</button>
+</div></header>
+<nav id="cameraTools" aria-label="카메라 시점">
+<button data-view="top">TOP</button><button data-view="front">FRONT</button><button data-view="side">SIDE</button>
+<button data-view="iso">ISOMETRIC</button><button data-view="follow" aria-pressed="false">FOLLOW DRONE</button>
+<button data-view="free" aria-pressed="true">FREE VIEW</button><button data-view="reset">RESET VIEW</button><button data-view="fit">FIT ALL</button>
+</nav>
+<p id="notice" role="status">3D 장면을 불러오는 중입니다.</p>
+<div id="scene"></div>
+<canvas id="map2d" hidden width="560" height="360" aria-label="버티포트 로컬 좌표 지도"></canvas>
+<p id="legend">● 현재 · ◆ 시작 · ◇ 목표 · 실선 이동 궤적 · 점선 목표 경로</p>
+<section class="twin-status" aria-label="위치 및 FOD 정보">
+<div><small>데이터 출처</small><strong id="source"></strong></div>
+<div><small>X/Y/Z <span>(m)</span></small><strong id="position"></strong></div>
+<div><small>Roll/Pitch/Yaw <span>(°)</span></small><strong id="attitude"></strong></div>
+<div><small>고도 · 비행 모드 · Armed</small><strong id="flight"></strong></div>
+<div><small>목표 거리</small><strong id="distance"></strong></div>
+<div><small>샘플 시각</small><strong id="received"></strong></div>
+<div><small>FOD 안전 판단</small><strong id="safety" role="status"></strong></div>
+<div><small>FOD 분석</small><strong id="fod"></strong></div>
+</section>
+</main>
+<script type="module">
+  const canvas = document.querySelector("#map2d");
+  const ctx = canvas.getContext("2d");
+  const plot = { left: 43, top: 18, right: 539, bottom: 319 };
+  let data, viewer, telemetryTimer, fodTimer, incoming;
+  let fallback = false;
+  let viewMode = "3d";
+  let pending;
+  const send = (type, extra = {}) => parent.postMessage({isStreamlitMessage: true, type, ...extra}, "*");
+  const resize = () => send("streamlit:setFrameHeight", {height: Math.ceil(document.querySelector("main").getBoundingClientRect().height)});
+  const sx = x => plot.left + (x + data.limit) * (plot.right - plot.left) / (2 * data.limit);
+  const sy = y => plot.bottom - (y + data.limit) * (plot.bottom - plot.top) / (2 * data.limit);
+  function line(x1, y1, x2, y2, color) {
+    ctx.strokeStyle = color;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+  function draw() {
+    if (!data) return;
+    ctx.fillStyle = "#0e1a2c";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.font = "12px system-ui";
+    for (let i = -data.limit; i <= data.limit; i += 2) {
+      const x = sx(i), y = sy(i);
+      line(x, plot.top, x, plot.bottom, i === 0 ? "#526b8c" : "#273b56");
+      line(plot.left, y, plot.right, y, i === 0 ? "#526b8c" : "#273b56");
+      ctx.fillStyle = "#b6c8df";
+      ctx.textAlign = "center"; ctx.fillText(i, x, plot.bottom + 16);
+      ctx.textAlign = "right"; ctx.fillText(i, plot.left - 8, y + 4);
+    }
+    const [px, py] = data.pad;
+    ctx.fillStyle = "#123e51";
+    ctx.fillRect(sx(px-1.4), sy(py+1.4), sx(2.8)-sx(0), sy(0)-sy(2.8));
+    ctx.strokeStyle = "#53d9ca";
+    ctx.strokeRect(sx(px-1.4), sy(py+1.4), sx(2.8)-sx(0), sy(0)-sy(2.8));
+    ctx.fillStyle = "#9de8e3";
+    ctx.textAlign = "center"; ctx.fillText("PAD", sx(px), sy(py+1.7));
+    ctx.fillText("X (m)", 290, 353); ctx.fillText("Y (m)", 20, 14);
+    const points = data.position ? [...data.path, data.position] : data.path;
+    for (let i = 1; i < points.length; i++) {
+      line(sx(points[i-1][0]), sy(points[i-1][1]), sx(points[i][0]), sy(points[i][1]), "#72aaff");
+    }
+    const [tx, ty] = pending ? [pending.x, pending.y] : data.target;
+    ctx.strokeStyle = "#ffce70";
+    ctx.strokeRect(sx(tx)-6, sy(ty)-6, 12, 12);
+    if (data.position) {
+      const [x, y] = data.position;
+      ctx.fillStyle = "#75baff";
+      ctx.beginPath(); ctx.arc(sx(x), sy(y), 4, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  const lifetime = new AbortController();
+  const options = {signal: lifetime.signal};
+  const node = id => document.getElementById(id);
+
+  function choose(x, y) {
+    if (!data || Math.abs(x) > data.limit || Math.abs(y) > data.limit) return;
+    pending = {x, y, id: `${Date.now()}-${Math.random()}`};
+    refresh();
+    send("streamlit:setComponentValue", {value: pending, dataType: "json"});
+  }
+
+  function refresh() {
+    if (!incoming) return;
+    const info = incoming.twin || {};
+    data = {...incoming, position: info.expired ? null : incoming.position};
+    if (info.expired) data.path = [];
+    if (pending) data.target = [pending.x, pending.y, data.target[2]];
+    if (viewMode === "2d") draw();
+    viewer?.update(data);
+    const format = values => values?.map(n => n.toFixed(2)).join(" / ") ?? "미확인";
+    node("source").textContent = `${info.mode || "—"} · ${info.source || "—"} · ${info.expired ? "데이터 지연" : info.connection || "—"}`;
+    node("position").textContent = format(data.position);
+    node("attitude").textContent = format(info.expired ? null : info.attitude);
+    node("flight").textContent = `고도 ${info.altitude != null && !info.expired ? info.altitude.toFixed(2) + " m" : "—"} · ${info.expired ? "—" : info.flight_mode || "—"} · ${info.expired || info.armed == null ? "—" : info.armed ? "ARMED" : "DISARMED"}`;
+    node("distance").textContent = data.position ? Math.hypot(...data.position.map((v,i) => v-data.target[i])).toFixed(2)+" m" : "—";
+    node("received").textContent = info.timestamp ? new Date(info.timestamp).toLocaleTimeString("ko-KR",{timeZone:"Asia/Seoul"}) + " KST" : "—";
+    const status = info.fodExpired || (info.expired && info.safety === "SAFE") ? "HOLD" : info.safety || "HOLD";
+    node("safety").dataset.state = status;
+    node("safety").textContent = status;
+    const fod = info.fodExpired ? null : info.fod;
+    node("fod").textContent = fod ? `FOD ${fod.count}개 · ${fod.confidence == null ? "—" : (fod.confidence*100).toFixed(1)+"%"} · ${new Date(fod.analyzed_at).toLocaleTimeString("ko-KR",{timeZone:"Asia/Seoul"})} KST` : "FOD · 미확인";
+  }
+  function selectView(mode) {
+    viewMode = mode;
+    node("scene").hidden = mode !== "3d";
+    node("cameraTools").hidden = mode !== "3d";
+    canvas.hidden = mode !== "2d";
+    node("show3d").setAttribute("aria-pressed", String(mode === "3d"));
+    node("show2d").setAttribute("aria-pressed", String(mode === "2d"));
+    viewer?.setVisible(mode === "3d");
+    refresh();
+    resize();
+  }
+  function useFallback() {
+    fallback = true;
+    viewer?.dispose();
+    viewer = null;
+    node("show3d").disabled = true;
+    node("notice").hidden = false;
+    node("notice").textContent = "3D 렌더링을 사용할 수 없어 2D 지도를 표시합니다.";
+    selectView("2d");
+  }
+  node("show3d").addEventListener("click", () => { if (!fallback) selectView("3d"); }, options);
+  node("show2d").addEventListener("click", () => selectView("2d"), options);
+  window.addEventListener("message", event => {
+    if (event.source !== parent || event.data?.type !== "streamlit:render") return;
+    incoming = event.data.args;
+    if (pending?.id === incoming.handled_click) pending = undefined;
+    clearTimeout(telemetryTimer);
+    clearTimeout(fodTimer);
+    if (incoming.twin?.valid_for_ms > 0) telemetryTimer = setTimeout(() => {
+      incoming.twin.expired = true;
+      refresh();
+    }, incoming.twin.valid_for_ms);
+    if (incoming.twin?.fod) fodTimer = setTimeout(() => {
+      incoming.twin.fodExpired = true;
+      refresh();
+    }, incoming.twin.fod.valid_for_ms ?? 3000);
+    refresh();
+  }, options);
+  canvas.addEventListener("click", event => {
+    if (!data) return;
+    const rect = canvas.getBoundingClientRect();
+    const cx = (event.clientX - rect.left) * canvas.width / rect.width;
+    const cy = (event.clientY - rect.top) * canvas.height / rect.height;
+    if (cx < plot.left || cx > plot.right || cy < plot.top || cy > plot.bottom) return;
+    choose((cx - plot.left) * 2 * data.limit / (plot.right - plot.left) - data.limit,
+           (plot.bottom - cy) * 2 * data.limit / (plot.bottom - plot.top) - data.limit);
+  }, options);
+  const observer = new ResizeObserver(resize);
+  observer.observe(document.querySelector("main"));
+  window.addEventListener("pagehide", () => {
+    lifetime.abort();
+    observer.disconnect();
+    clearTimeout(telemetryTimer);
+    clearTimeout(fodTimer);
+    viewer?.dispose();
+  }, {once:true});
+  send("streamlit:componentReady", {apiVersion: 1});
+  import("./twin.js").then(({mountTwin}) => {
+    if (lifetime.signal.aborted) return;
+    viewer = mountTwin(node("scene"), node("cameraTools"), choose, useFallback);
+    node("notice").hidden = true;
+    selectView(viewMode);
+  }).catch(useFallback);
+</script>
+</html>

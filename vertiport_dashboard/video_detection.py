@@ -1,7 +1,7 @@
 """WebRTC 트랙별 최신 프레임 분석 상태와 영상 오버레이."""
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread
 from time import monotonic
 
@@ -42,6 +42,8 @@ class VideoAnalysis:
         self._episode_active = False
         self._clear_since = None
         self._last_sample = None
+        self._analysis_at = None
+        self._processing_ms = None
 
     def configure(self, settings, save_detection=None):
         with self._lock:
@@ -84,6 +86,9 @@ class VideoAnalysis:
                 "fod_detected": bool(boxes),
                 "fod_count": len(boxes),
                 "confidence": max((score for _, score in boxes), default=None),
+                "analyzed_at": self._analysis_at,
+                "processing_ms": self._processing_ms,
+                "valid_for_ms": max(0, round((self._settings[-1] - (now - self._result[0])) * 1000)),
             }, ""
 
     def _new_episode(self, boxes, received, max_gap):
@@ -144,6 +149,9 @@ class VideoAnalysis:
             self._busy = False
             if not self._closed and generation == self._generation:
                 self._result, self._error = latest, error
+                if latest is not None:
+                    self._processing_ms = (latest[1] - received) * 1000
+                    self._analysis_at = captured_at + timedelta(milliseconds=self._processing_ms)
                 if latest is None:
                     self._clear_since = self._last_sample = None
                 elif latest[1] - received <= settings[-1]:

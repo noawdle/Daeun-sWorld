@@ -8,19 +8,26 @@
 """
 
 import csv
-import math
+import os
 import sys
+import platform
 import time
 from html import escape
-from datetime import timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
 from fod_detection import get_model, model_identity, render_fod_detection
-from event_logger import LOG_FILE, load_events, save_event
+from event_logger import KST, LOG_FILE, load_events, save_event
 from drone_simulator import get_drone_state
+from map_controller import MAP_LIMIT, MAX_ALTITUDE, local_target, render_map
+from mission_controller import DemoMission, PAD, STAGES
+from gazebo_bridge_client import BridgeError, CoordinateTransform, GazeboBridgeClient
+from digital_twin import TwinTrace, bridge_view, demo_attitude
+from telemetry_provider import DemoTelemetry, GazeboTelemetryProvider, unavailable_telemetry
 from fod_snapshots import SNAPSHOT_DIR, load_snapshots, save_snapshot
+from fod_gallery_state import hide_photos, load_hidden_photos
 from video_detection import VIDEO_IDLE, VIDEO_STOPPED, VideoAnalysis
 
 ROOT = Path(__file__).resolve().parent
@@ -28,9 +35,7 @@ PROJECT_ROOT = ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from smart_vertiport.landing_policy import evaluate_landing
-
-KST = timezone(timedelta(hours=9))
+from smart_vertiport.landing_policy import evaluate_fod_landing
 SIMULATION_SCENARIOS = {
     "정상 비행": "normal",
     "배터리 부족": "low_battery",
@@ -86,43 +91,6 @@ def seek_simulation():
 
 
 
-def validate_landing_inputs(drone, vertiport, detection):
-    """시연 데이터가 비정상이면 판단을 실행하지 않습니다."""
-    if not isinstance(drone, dict) or not isinstance(vertiport, dict):
-        raise ValueError("드론 및 환경 입력 형식 오류")
-    if not isinstance(drone.get("id"), str) or not drone["id"].strip():
-        raise ValueError("드론 ID 누락")
-    battery = drone.get("battery")
-    if (type(battery) not in (int, float) or not math.isfinite(battery)
-            or not 0 <= battery <= 100):
-        raise ValueError("배터리는 0~100 범위의 유효한 숫자여야 합니다.")
-    if type(drone.get("emergency")) is not bool:
-        raise ValueError("긴급 상태 값이 올바르지 않습니다.")
-
-    for key in ("person_detected", "vehicle_detected", "fod_detected", "pad_occupied"):
-        if type(vertiport.get(key)) is not bool:
-            raise ValueError(f"환경 입력 오류: {key}")
-
-    if not isinstance(detection, dict):
-        raise ValueError("YOLO 탐지 결과 누락")
-    count = detection.get("fod_count")
-    if type(count) is not int or count < 0:
-        raise ValueError("YOLO 탐지 개수 오류")
-    if type(detection.get("fod_detected")) is not bool:
-        raise ValueError("YOLO 탐지 여부 오류")
-    if detection["fod_detected"] != (count > 0):
-        raise ValueError("탐지 개수와 FOD 탐지 여부가 일치하지 않습니다.")
-    if vertiport["fod_detected"] != detection["fod_detected"]:
-        raise ValueError("YOLO 탐지 결과와 판단 입력이 다릅니다.")
-    score = detection.get("confidence")
-    if count == 0:
-        if score is not None:
-            raise ValueError("탐지 객체가 없는데 신뢰도 값이 있습니다.")
-    elif (type(score) not in (int, float) or not math.isfinite(score)
-          or not 0 <= score <= 1):
-        raise ValueError("YOLO 탐지 신뢰도 오류")
-
-
 def record_fod_state(detection, drone_id, battery, mode, unavailable_reason):
     """영상은 탐지 여부가 바뀔 때, 이미지는 새 분석도 기록합니다."""
     count = detection["fod_count"] if detection is not None else None
@@ -173,114 +141,33 @@ def record_decision_change(status, reason, drone_id, battery, detection=None,
         st.session_state["last_logged_decision"] = event_key
 
 
-# STEP 5-3: 판단 기준과 데이터 흐름은 변경하지 않고 화면 표현만 보완합니다.
-_STATUS_PRESENTATION = {
-    "접근 제한": ("⛔", "danger", "위험요소가 확인되어 착륙장 접근을 제한합니다."),
-    "대기": ("⏳", "warning", "착륙장이 점유 중이므로 대기합니다."),
-    "착륙 가능": ("✅", "success", "현재 시연 조건에서 착륙 판단 기준을 충족했습니다."),
-    "판단 확인 필요": ("🔎", "neutral", "유효한 탐지 결과 또는 입력값 확인이 필요합니다."),
-    "요청 없음": ("⏸️", "info", "드론의 착륙 요청이 없습니다."),
+st.set_page_config(page_title="스마트 버티포트 | 통합 관제", layout="wide", initial_sidebar_state="collapsed")
+st.markdown('''<style>
+.block-container {max-width: 1700px; padding-top: 1.4rem}
+:is(.st-key-system_cards, .st-key-drone_cards, .st-key-fod_cards, .st-key-image_fod_cards, .st-key-simulation_cards)
+    [data-testid="stMetric"], .control-card {
+    background: #10233f; border: 1px solid #304967; border-radius: 10px;
 }
-
-
-def render_status_card(status):
-    """상태를 색상·아이콘과 설명이 있는 카드로 표시합니다."""
-    icon, tone, explanation = _STATUS_PRESENTATION.get(
-        status, ("❔", "neutral", "알 수 없는 상태입니다.")
-    )
-    st.markdown(
-        f"""<div class="landing-status landing-status--{tone}" role="status">
-  <span class="landing-status__icon" aria-hidden="true">{icon}</span>
-  <div class="landing-status__body">
-    <div class="landing-status__eyebrow">착륙 판단 상태 · 시뮬레이션</div>
-    <div class="landing-status__value">{escape(status)}</div>
-    <div class="landing-status__description">{escape(explanation)}</div>
-  </div>
-</div>""",
-        unsafe_allow_html=True,
-    )
-
-
-def render_condition_chips(detection, pad_occupied, emergency, data_source):
-    """현재 판단에 사용되는 핵심 입력을 시각적으로 요약합니다."""
-    if detection is None:
-        fod_label, fod_tone = "FOD · 유효 결과 없음", "neutral"
-    elif detection["fod_detected"]:
-        fod_label, fod_tone = f'FOD · {detection["fod_count"]}개 탐지', "danger"
-    else:
-        fod_label, fod_tone = "FOD · 미탐지", "success"
-
-    pad_label = "착륙장 · 점유" if pad_occupied else "착륙장 · 미점유 (설정값)"
-    pad_tone = "warning" if pad_occupied else "neutral"
-    input_type = "시뮬레이션 데이터" if data_source == "simulation" else "직접 설정"
-    emergency_label = (
-        f"긴급 상태 · 발생 ({input_type})" if emergency
-        else f"긴급 상태 · 없음 ({input_type})"
-    )
-    emergency_tone = "danger" if emergency else "neutral"
-
-    chips = (
-        (fod_label, fod_tone), (pad_label, pad_tone),
-        ("사람 · 있음" if person_detected else "사람 · 없음", "danger" if person_detected else "neutral"),
-        ("차량 · 있음" if vehicle_detected else "차량 · 없음", "danger" if vehicle_detected else "neutral"),
-        (emergency_label, emergency_tone),
-    )
-    chips_html = "".join(
-        f'<span class="landing-chip landing-chip--{tone}">{escape(label)}</span>'
-        for label, tone in chips
-    )
-    st.markdown(f'<div class="landing-chips">{chips_html}</div>', unsafe_allow_html=True)
-
-
-st.set_page_config(
-    page_title="스마트 버티포트 | 통합 모니터링",
-    page_icon="🛬",
-    layout="wide",
-)
-st.markdown(
-    """<style>
-    .stApp {background: #f5f7fb;}
-    .block-container {padding-top: 1.1rem; max-width: 1500px;}
-    h1, h2, h3 {color: #14243c;}
-    [data-testid="stMetric"] {
-        background: white; border: 1px solid #e3e9f2;
-        border-radius: 12px; padding: 9px 12px;
-    }
-    /* STEP 5-4: 요약 상태 카드와 주요 지표가 상단에서 균형 있게 보이도록 조정합니다. */
-    .top-summary-title {font-size: 18px; font-weight: 700; color: #14243c; margin: 0 0 9px;}
-    .section-help {color: #64748b; font-size: 12px; margin-bottom: 10px;}
-    /* STEP 5-3: 상태 카드는 동일한 형태를 유지하면서 색상만 구분합니다. */
-    .landing-status {
-        display: flex; align-items: center; gap: 16px;
-        padding: 17px 18px; margin: 2px 0 8px;
-        border: 1px solid; border-left-width: 6px;
-        border-radius: 14px;
-    }
-    .landing-status__icon {font-size: 32px; flex-shrink: 0; line-height: 1.2;}
-    .landing-status__body {min-width: 0;}
-    .landing-status__eyebrow {font-size: 12px; font-weight: 600; opacity: .85;}
-    .landing-status__value {
-        font-size: clamp(23px, 2.3vw, 31px);
-        line-height: 1.35; font-weight: 750; margin: 3px 0;
-    }
-    .landing-status__description {font-size: 13px; line-height: 1.5;}
-    .landing-status--danger {background: #fff1f2; border-color: #fda4af; color: #9f1239;}
-    .landing-status--warning {background: #fffbeb; border-color: #fcd34d; color: #92400e;}
-    .landing-status--success {background: #ecfdf5; border-color: #6ee7b7; color: #065f46;}
-    .landing-status--neutral {background: #f1f5f9; border-color: #cbd5e1; color: #334155;}
-    .landing-status--info {background: #eff6ff; border-color: #93c5fd; color: #1e40af;}
-    .landing-chips {display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 18px;}
-    .landing-chip {
-        display: inline-block; font-size: 12px; line-height: 1.35;
-        padding: 6px 10px; border-radius: 999px; border: 1px solid;
-        background: #f8fafc; border-color: #cbd5e1; color: #475569;
-    }
-    .landing-chip--danger {background: #fff1f2; border-color: #fda4af; color: #9f1239;}
-    .landing-chip--warning {background: #fffbeb; border-color: #fcd34d; color: #92400e;}
-    .landing-chip--success {background: #ecfdf5; border-color: #6ee7b7; color: #065f46;}
-    </style>""",
-    unsafe_allow_html=True,
-)
+:is(.st-key-system_cards, .st-key-drone_cards, .st-key-fod_cards, .st-key-image_fod_cards, .st-key-simulation_cards)
+    [data-testid="stMetric"] {padding: 8px 10px; height: 100%;}
+:is(.st-key-system_cards, .st-key-drone_cards, .st-key-fod_cards, .st-key-image_fod_cards, .st-key-simulation_cards)
+    [data-testid="stMetricLabel"] :is(label, p, span) {color: #cbd5e1; font-weight: 500;}
+:is(.st-key-system_cards, .st-key-drone_cards, .st-key-fod_cards, .st-key-image_fod_cards, .st-key-simulation_cards)
+    [data-testid="stMetricLabel"] p {white-space: normal;}
+:is(.st-key-system_cards, .st-key-drone_cards, .st-key-fod_cards, .st-key-image_fod_cards, .st-key-simulation_cards)
+    [data-testid="stMetricValue"],
+:is(.st-key-system_cards, .st-key-drone_cards, .st-key-fod_cards, .st-key-image_fod_cards, .st-key-simulation_cards)
+    [data-testid="stMetricValue"] > div {
+    color: #fff; font-size: 1.125rem; font-weight: 700; line-height: 1.3;
+    white-space: normal; overflow-wrap: anywhere;
+}
+.control-card {padding: 12px 14px; color: #afc0d4; border-left: 4px solid var(--verdict);}
+.control-card strong {display: block; color: var(--verdict); font-size: 1.35rem; margin: .2rem 0;}
+.control-card small {color: #cbd5e1;}
+.control-card.safe {--verdict: #22c55e;}
+.control-card.hold {--verdict: #fbbf24;}
+.control-card.unsafe {--verdict: #f87171;}
+</style>''', unsafe_allow_html=True)
 
 @st.fragment(run_every="1s")
 def render_simulation_clock(scenario):
@@ -289,7 +176,8 @@ def render_simulation_clock(scenario):
     status = "진행 중" if st.session_state.get("sim_running") else "일시정지 / 대기"
     if elapsed >= SIMULATION_MAX_SECONDS:
         status = "120초 시연 종료"
-    st.metric("시뮬레이션 경과 시간", f"{int(elapsed)}초")
+    with st.container(key="simulation_cards"):
+        st.metric("시뮬레이션 경과 시간", f"{int(elapsed)}초")
     state = get_drone_state(elapsed, scenario=scenario)
     st.caption(f"{status} · {state['flight_phase']} · 배터리 {state['battery']}% / 고도 {state['altitude_m']:g}m")
 
@@ -319,7 +207,6 @@ with st.sidebar:
         data_source = "manual"
         manual_battery = st.slider("배터리 (%)", 0, 100, 68)
         manual_emergency = st.checkbox("긴급 상태", value=False)
-        manual_landing_requested = st.checkbox("착륙 요청", value=True)
         manual_altitude = st.number_input(
             "고도 (m, 시뮬레이션)", min_value=0.0, max_value=100000.0,
             value=12.5, step=0.5,
@@ -360,15 +247,6 @@ with st.sidebar:
             "상단 상태 정보는 약 1초마다 갱신됩니다."
         )
 
-    st.divider()
-    st.subheader("착륙장 조건 설정")
-    person_detected = st.checkbox("사람 있음", value=False)
-    vehicle_detected = st.checkbox("차량 있음", value=False)
-    pad_occupied = st.checkbox("착륙장 점유 중", value=False)
-    st.caption("FOD 여부는 선택한 입력의 YOLO 탐지 결과로 결정합니다.")
-
-st.title("스마트 버티포트 통합 모니터링")
-st.caption("시뮬레이션 · 단일 드론 상태 및 착륙장 FOD 관제")
 
 team_weights = PROJECT_ROOT / "train_model" / "weights" / "best.pt"
 standalone_weights = ROOT / "models" / "best.pt"
@@ -434,142 +312,6 @@ def render_video_stream(save_detection):
     return None, VIDEO_IDLE
 
 
-def make_snapshot_saver():
-    """캡처 시점의 기체·환경 입력으로 판단해 저장하는 작업을 만듭니다."""
-    elapsed = simulation_elapsed()
-    baseline = time.monotonic()
-    running = st.session_state["sim_running"]
-    scenario = SIMULATION_SCENARIOS[scenario_label] if data_source == "simulation" else None
-    manual = None if scenario else {
-        "id": "DRONE-01", "battery": manual_battery, "emergency": manual_emergency,
-        "landing_requested": manual_landing_requested,
-    }
-    environment = (person_detected, vehicle_detected, pad_occupied)
-
-    def persist(image, boxes, received, captured_at):
-        drone = manual
-        if scenario:
-            offset = max(0, received - baseline) if running else 0
-            drone = get_drone_state(min(SIMULATION_MAX_SECONDS, elapsed + offset), scenario=scenario)
-        detection = {"fod_detected": True, "fod_count": len(boxes),
-                     "confidence": max(score for _, score in boxes)}
-        outcome = evaluate_current_state(
-            detection, drone["id"], drone["battery"], drone["emergency"],
-            drone["landing_requested"], *environment, record=False,
-        )
-        save_snapshot(image, captured_at, detection, drone, outcome["status"])
-
-    return persist
-
-
-@st.fragment(run_every="1s")
-def monitoring_panel():
-    # fragment가 갱신될 때마다 가상 시간을 재계산합니다.
-    # 전역 변수로 최초 1회 계산하면 시간이 흘러도 값이 바뀌지 않습니다.
-    if data_source == "simulation":
-        simulated = get_drone_state(
-            simulation_elapsed(), scenario=SIMULATION_SCENARIOS[scenario_label]
-        )
-        drone_id = simulated["id"]
-        battery = simulated["battery"]
-        altitude_m = simulated["altitude_m"]
-        emergency = simulated["emergency"]
-        landing_requested = simulated["landing_requested"]
-        flight_phase = simulated["flight_phase"]
-        time_label = f" · 경과 시간: {simulated['elapsed_seconds']}초"
-    else:
-        drone_id = "DRONE-01"
-        battery = manual_battery
-        altitude_m = manual_altitude
-        emergency = manual_emergency
-        landing_requested = manual_landing_requested
-        flight_phase = "직접 설정"
-        time_label = ""
-
-    if detection_mode == "이미지 업로드":
-        image_col, summary_col = st.columns([1.35, 1], gap="medium")
-        summary_slot = summary_col.empty()
-    else:
-        summary_slot = video_summary
-    col_detect, col_decision = st.columns([1.35, 1], gap="medium")
-
-    if detection_mode == "이미지 업로드":
-        with image_col:
-            detection = render_fod_detection(weights, KST)
-            unavailable_reason = (
-                "YOLO 이미지 추론에 실패했습니다." if "fod_error" in st.session_state
-                else "유효한 이미지 분석 결과가 없습니다."
-            )
-    else:
-        detection, unavailable_reason = (
-            video_processor.snapshot() if video_processor is not None else (None, video_reason)
-        )
-        video_connection.caption(video_processor.connection_status() if video_processor else video_reason)
-
-    with col_detect:
-        st.subheader("실시간 FOD 탐지 결과" if detection_mode == "실시간 영상 분석" else "이미지 FOD 탐지 결과")
-        count_col, score_col = st.columns(2)
-        count_col.metric("FOD 탐지 수", f'{detection["fod_count"]}개' if detection else "미확인")
-        score = detection["confidence"] if detection else None
-        score_col.metric("최고 탐지 신뢰도", "—" if score is None else f"{score:.1%}")
-        st.caption(unavailable_reason if detection is None else
-                   ("FOD 탐지" if detection["fod_detected"] else "FOD 미탐지"))
-        if detection_mode == "실시간 영상 분석" and video_processor is not None:
-            if error := video_processor.snapshot_error():
-                st.warning(error)
-
-    record_fod_state(detection, drone_id, battery, detection_mode, unavailable_reason)
-
-    outcome = evaluate_current_state(
-        detection, drone_id, battery, emergency, landing_requested,
-        person_detected, vehicle_detected, pad_occupied, unavailable_reason,
-    )
-
-    with summary_slot.container():
-        st.markdown('<div class="top-summary-title">종합 모니터링 현황</div>',
-                    unsafe_allow_html=True)
-        source_label = "드론 시뮬레이션 데이터" if data_source == "simulation" else "직접 설정 데이터"
-        st.caption(f"{drone_id} · 단일 드론 · {source_label} · 비행 단계: {flight_phase}{time_label}")
-        render_status_card(outcome["status"])
-        col_battery, col_altitude = st.columns(2, gap="small")
-        col_fod, col_emergency = st.columns(2, gap="small")
-        with col_battery:
-            st.metric("배터리", f"{battery}%")
-        with col_altitude:
-            st.metric("고도 (시뮬레이션)", f"{altitude_m:g} m")
-        with col_fod:
-            st.metric("FOD 탐지", "미확인" if detection is None
-                      else f'{detection["fod_count"]}개')
-        col_emergency.metric("긴급 상태", "발생" if emergency else "없음")
-        st.info("권고 조치 · " + outcome["recommended_action"])
-
-    with col_decision:
-        st.subheader("판단 근거 및 권고 조치")
-        st.caption("현재 기체 상태와 착륙장 조건을 종합해 판단합니다.")
-        render_condition_chips(detection, pad_occupied, emergency, data_source)
-
-        if outcome["message_kind"] == "error":
-            st.error(outcome["message"])
-        elif outcome["message_kind"] == "warning":
-            st.warning(outcome["message"])
-        elif outcome["message_kind"] == "success":
-            st.success(outcome["message"])
-        else:
-            st.info(outcome["message"])
-
-        for warning in outcome["warnings"]:
-            st.warning("기체 경고: " + str(warning))
-        st.write("기체 경고 수준:", outcome["alert_level"])
-        st.info("권고 조치: " + outcome["recommended_action"])
-        st.caption(
-            "판단 기준: FOD 탐지 및 환경 조건·기체 상태 데이터. "
-            "배터리 부족·긴급 상태는 팀 알고리즘에서 경고 조건입니다."
-        )
-        if outcome["debug"] is not None:
-            with st.expander("판단 입출력 확인"):
-                st.json(outcome["debug"])
-
-
 @st.fragment(run_every="5s")
 def render_history():
     st.divider()
@@ -620,12 +362,49 @@ def render_history():
     render_gallery(photos)
 
 
+def set_gallery_reset_confirmation(open_):
+    st.session_state["confirm_gallery_reset"] = open_
+    st.session_state.pop("gallery_reset_error", None)
+
+
+def confirm_gallery_reset():
+    try:
+        hide_photos(load_snapshots())
+    except (OSError, ValueError) as error:
+        st.session_state["gallery_reset_error"] = str(error)
+    else:
+        set_gallery_reset_confirmation(False)
+        st.session_state.pop("gallery_selected_photo", None)
+
+
 def render_gallery(photos):
     st.subheader("자동 저장된 FOD 탐지 사진")
-    if not photos:
-        st.info("저장된 FOD 탐지 사진이 없습니다.")
+    st.button("↻ 대시보드 사진 초기화", on_click=set_gallery_reset_confirmation, args=(True,))
+    if st.session_state.get("confirm_gallery_reset"):
+        st.warning("기존 FOD 사진을 대시보드에서 숨깁니다. 실제 저장된 사진 파일은 삭제되지 않습니다.")
+        confirm, cancel = st.columns(2)
+        confirm.button("초기화", key="confirm_fod_gallery_reset", on_click=confirm_gallery_reset)
+        cancel.button("취소", key="cancel_fod_gallery_reset", on_click=set_gallery_reset_confirmation, args=(False,))
+        if error := st.session_state.get("gallery_reset_error"):
+            st.error(f"사진 표시 상태를 저장하지 못했습니다 · {error}")
+    try:
+        hidden = load_hidden_photos()
+    except (OSError, ValueError) as error:
+        st.warning(f"사진 표시 상태를 읽지 못했습니다 · {error}")
         return
+    photos = [photo for photo in photos if photo["photo"] not in hidden]
+    st.caption(f"표시 사진 {len(photos)}장")
     selection_key = "gallery_selected_photo"
+    by_name = {photo["photo"]: photo for photo in photos}
+    selected = st.session_state.get(selection_key)
+    if selected is not None and selected not in by_name:
+        st.session_state.pop(selection_key, None)
+    if not photos:
+        st.info(
+            "표시할 FOD 탐지 사진이 없습니다. 기존 사진 파일은 안전하게 보관되어 있습니다."
+            if hidden else "저장된 FOD 탐지 사진이 없습니다."
+        )
+        return
     for column, photo in zip(st.columns(3), photos[:3]):
         with column, st.container(border=True):
             try:
@@ -638,7 +417,6 @@ def render_gallery(photos):
             except OSError as error:
                 st.warning(f"사진을 불러올 수 없습니다 · {error}")
     with st.expander("전체 탐지 이력 및 사진 상세"):
-        by_name = {photo["photo"]: photo for photo in photos}
         name = st.selectbox(
             "탐지 사진 선택", list(by_name), index=None, key=selection_key,
             format_func=lambda filename: f"{photo_caption(by_name[filename])} · {filename[-12:-4]}",
@@ -658,117 +436,403 @@ def photo_caption(photo):
             f'{photo["confidence"]:.1%} · {photo["status"]}')
 
 
-def evaluate_current_state(detection, drone_id, battery, emergency,
-                           landing_requested, person_detected, vehicle_detected,
-                           pad_occupied, unavailable_reason="유효한 FOD 탐지 결과가 없습니다.",
-                           *, record=True):
-    """직접 설정/시뮬레이션 데이터에 동일한 판단 규칙을 적용합니다."""
-    log_decision = record_decision_change if record else lambda *args: None
-    if detection is None:
-        log_decision(
-            "판단 확인 필요", unavailable_reason,
-            drone_id, battery,
-        )
-        return {
-            "status": "판단 확인 필요",
-            "message_kind": "warning",
-            "message": unavailable_reason,
-            "warnings": [],
-            "alert_level": "판단 보류",
-            "recommended_action": "현재 FOD 입력을 확인하고 최신 분석 결과 확보",
-            "debug": None,
-        }
 
-    if not landing_requested:
-        log_decision(
-            "요청 없음", "착륙 요청이 없어 판단 미실행",
-            drone_id, battery, detection,
-        )
-        return {
-            "status": "요청 없음",
-            "message_kind": "info",
-            "message": "드론의 착륙 요청이 없어 착륙 판단을 수행하지 않습니다.",
-            "warnings": [],
-            "alert_level": "—",
-            "recommended_action": "착륙 요청 이후 탐지 결과 유효성을 확인하여 재판단",
-            "debug": None,
-        }
 
-    drone = {"id": drone_id, "battery": battery, "emergency": emergency}
-    vertiport = {
-        "person_detected": person_detected,
-        "vehicle_detected": vehicle_detected,
-        "fod_detected": detection["fod_detected"],
-        "pad_occupied": pad_occupied,
-    }
-
+def log_mission(event, description, drone):
     try:
-        validate_landing_inputs(drone, vertiport, detection)
-        result = evaluate_landing(drone, vertiport)
-        if result.get("status") not in ("접근 제한", "대기", "착륙 가능"):
-            raise ValueError("알 수 없는 착륙 판단 상태")
-        if not isinstance(result.get("reason"), str):
-            raise ValueError("착륙 판단 사유 오류")
-        if not isinstance(result.get("warnings"), list):
-            raise ValueError("기체 경고 목록 오류")
-        if not isinstance(result.get("alert_level"), str):
-            raise ValueError("기체 경고 수준 오류")
-        if not isinstance(result.get("recommended_action"), str):
-            raise ValueError("권고 조치 오류")
-    except Exception as error:
-        log_decision(
-            "판단 확인 필요", f"착륙 판단 처리 오류: {error}",
-            drone_id, battery, detection,
+        save_event(event, drone_id=drone["id"], battery=drone["battery"], description=description)
+    except OSError as error:
+        st.warning(f"이벤트 기록 실패 · {error}")
+
+
+def make_snapshot_saver(provider):
+    elapsed, baseline = simulation_elapsed(), time.monotonic()
+    running = st.session_state["sim_running"]
+
+    def persist(image, boxes, received, captured_at):
+        offset = max(0, received - baseline) if running else 0
+        if isinstance(provider, GazeboTelemetryProvider):
+            drone = provider.latest()
+        elif provider is None:
+            drone = unavailable_telemetry("미연동")
+        else:
+            drone = provider.read(min(SIMULATION_MAX_SECONDS, elapsed + offset))
+        detection = {"fod_detected": True, "fod_count": len(boxes),
+                     "confidence": max(score for _, score in boxes)}
+        outcome = evaluate_fod_landing(
+            detection, pad_confirmed=False, telemetry_ready=False, communication_ready=False,
+            battery=drone["battery"], emergency=drone["emergency"],
         )
-        return {
-            "status": "판단 확인 필요",
-            "message_kind": "error",
-            "message": f"착륙 판단 처리 오류: {error}",
-            "warnings": [],
-            "alert_level": "판단 보류",
-            "recommended_action": "입력값과 착륙 판단 처리 오류 확인 후 재검사",
-            "debug": None,
-        }
+        save_snapshot(image, captured_at, detection, drone | {"id": drone["id"] or "—"}, outcome["status"])
 
-    status = result["status"]
-    log_decision(
-        status, result["reason"], drone_id, battery,
-        detection, result["alert_level"],
-    )
-    if status == "접근 제한":
-        message_kind, message = "error", result["reason"]
-    elif status == "대기":
-        message_kind, message = "warning", result["reason"]
+    return persist
+
+
+def render_mission(mission, drone, now):
+    st.subheader("임무 제어")
+    st.caption("DEMO · 로컬 시뮬레이션")
+    if st.button("사전 점검", width="stretch", disabled=mission.stage not in (0, 8)):
+        mission.prechecked = weights.is_file() and not drone["emergency"] and drone["battery"] >= 20
+        log_mission("사전 점검", "DEMO 통과" if mission.prechecked else "모델 또는 기체 상태 확인 필요", drone)
+    if st.button("임무 시작", width="stretch", type="primary",
+                 disabled=not mission.prechecked or mission.stage not in (0, 8)):
+        if mission.target[2] <= 0:
+            st.warning("임무 시작에는 0 m보다 높은 목표 고도가 필요합니다.")
+        elif weights.is_file() and not drone["emergency"] and drone["battery"] >= 20 and mission.start(now):
+            log_mission("임무 시작", "DEMO 임무 시작", drone)
+        else:
+            mission.prechecked = False
+            st.warning("사전 점검을 다시 수행해 주세요.")
+    if st.button("임무 재개" if mission.paused_at is not None else "Hover / 일시정지", width="stretch",
+                 disabled=mission.stage in (0, 8)):
+        mission.toggle_pause(now)
+        log_mission("임무 상태 변경", "DEMO 일시정지" if mission.paused_at is not None else "DEMO 재개", drone)
+    if st.button("착륙 요청", width="stretch", disabled=mission.stage not in (4, 5) or mission.requested):
+        mission.requested = True
+        log_mission("착륙 요청", "DEMO 요청 대기", drone)
+    if st.button("임무 취소", width="stretch", disabled=mission.stage in (0, 8)):
+        mission.cancel()
+        log_mission("임무 취소", "DEMO 임무 취소", drone)
+    if st.button("패드 위치 확인", width="stretch", disabled=mission.stage != 4 or mission.pad_confirmed):
+        mission.pad_confirmed = True
+    if mission.prechecked:
+        st.caption("사전 점검 통과")
+    if drone["emergency"]:
+        st.error("비상 대응 · 기체 긴급 상태")
+    elif drone["battery"] < 20:
+        st.warning("비상 대응 · 배터리 부족")
     else:
-        message_kind, message = "success", "시연 조건에서 착륙 가능: " + result["reason"]
+        st.caption("비상 대응 · 대기")
+    for index, stage in enumerate(STAGES):
+        if index == mission.stage:
+            st.markdown(f"**● {stage}**" + (" · 일시정지" if mission.paused_at is not None else ""))
+        else:
+            st.caption(("✓ " if index < mission.stage else "○ ") + stage)
 
-    return {
-        "status": status,
-        "message_kind": message_kind,
-        "message": message,
-        "warnings": result["warnings"],
-        "alert_level": result["alert_level"],
-        "recommended_action": result["recommended_action"],
-        "debug": {"drone": drone, "vertiport": vertiport, "result": result},
+
+def submit_bridge_command(command, drone, action):
+    try:
+        if not (provider.latest()["fresh"] and drone["simulation_ready"] and bridge_client.enable_commands):
+            raise BridgeError("BRIDGE_NOT_READY", "시뮬레이션 준비, 최신 텔레메트리 및 명령 설정을 확인해 주세요.")
+        result = action()
+        status = "승인" if result["accepted"] else "거절"
+        message = f'{command} · {status} · ID {result.get("command_id") or "—"}'
+        if not result["accepted"] and result.get("code"):
+            message += f' · {result["code"]}'
+        if detail := result.get("message"):
+            message += f" · {detail}"
+        st.session_state["bridge_command_result"] = (result["accepted"], message)
+    except (BridgeError, ValueError) as error:
+        message = f"{command} · {getattr(error, 'code', 'INVALID_COORDINATES')} · {error}"
+        st.session_state["bridge_command_result"] = (False, message)
+    log_mission("Bridge 명령", message, drone)
+
+
+def render_bridge_controls(drone, outcome):
+    st.subheader("Bridge 임무 제어")
+    st.caption(drone["connection"])
+    if bridge_client is None:
+        return
+    ready = drone["fresh"] and drone["simulation_ready"] and bridge_client.enable_commands
+    if st.button("Hover", disabled=not ready):
+        submit_bridge_command("Hover", drone, bridge_client.hover)
+    if st.button("착륙 요청", key="bridge_land", disabled=not (
+        ready and bridge_client.mock and outcome["status"] == "SAFE" and drone["telemetry_id"]
+    )):
+        submit_bridge_command("착륙 요청", drone, lambda: bridge_client.request_landing(
+            safety=outcome["status"], telemetry_id=drone["telemetry_id"],
+        ))
+    if st.button("임무 취소", key="bridge_cancel", disabled=not ready):
+        submit_bridge_command("임무 취소", drone, bridge_client.cancel_mission)
+    if not bridge_client.mock:
+        st.caption("Bridge 하향 영상의 안전 판단 연동 대기")
+
+
+def render_target(mission, drone, now, detection, outcome):
+    st.subheader("버티포트 디지털 트윈")
+    draft = tuple(st.session_state.get(key, fallback)
+                  for key, fallback in zip(("target_x", "target_y", "target_z"), mission.target))
+    position, attitude, valid_for, path = None, None, None, []
+    connection = drone["connection"]
+    timestamp = drone["timestamp"]
+    flight_mode = drone["flight_mode"]
+    armed = drone["armed"]
+    transform = bridge_client.transform if bridge_client else None
+    trace = st.session_state["twin_trace"]
+    source = (mode, drone["source"], transform)
+    if mode == "DEMO":
+        position, path = mission.position(now), mission.path
+        attitude = demo_attitude(mission)
+        timestamp = datetime.now(KST).isoformat()
+        flight_mode, armed = STAGES[mission.stage], 0 < mission.stage < 8
+        trace.update(source, None, None)
+    elif mode == "GAZEBO":
+        position, attitude, valid_for, connection = bridge_view(drone, transform)
+        sampled_at = datetime.fromisoformat(timestamp) if position is not None else None
+        path = trace.update(source, position, sampled_at)
+    else:
+        trace.update(source, None, None)
+    twin = {
+        "source": drone["source"], "mode": mode, "connection": connection,
+        "attitude": attitude, "valid_for_ms": valid_for, "timestamp": timestamp,
+        "altitude": position[2] if mode == "DEMO" else drone["altitude_m"],
+        "flight_mode": flight_mode, "armed": armed,
+        "fod": None if detection is None else {
+            "count": detection["fod_count"], "confidence": detection["confidence"],
+            "analyzed_at": detection["analyzed_at"].astimezone(KST).isoformat(),
+            "valid_for_ms": detection["valid_for_ms"],
+        },
+        "safety": outcome["status"],
     }
+    point = render_map(position, draft, path, PAD, st.session_state.get("handled_map_click"), twin=twin)
+    if isinstance(point, dict) and point.get("id") and point["id"] != st.session_state.get("handled_map_click"):
+        st.session_state["handled_map_click"] = point["id"]
+        try:
+            x, y, _ = local_target(point.get("x"), point.get("y"), draft[2])
+            st.session_state.update(target_x=x, target_y=y)
+            log_mission("목표 좌표 지정", f"지도 선택 X {x:.2f} / Y {y:.2f} / Z {draft[2]:.2f} m", drone)
+        except ValueError as error:
+            st.warning(str(error))
+    st.caption("● 기체 위치 · □ 목표점 · PAD 설정 구역 · Z는 위쪽 고도")
+    st.caption(f"현재 위치 · X {position[0]:.2f} / Y {position[1]:.2f} / Z {position[2]:.2f} m"
+               if position is not None else "현재 지도 위치 · 미확인")
+    coords = st.columns(3)
+    values = [
+        col.number_input(label, min_value=low, max_value=high, step=0.1, format="%.2f", key=key)
+        for col, label, key, low, high in zip(
+            coords, ("목표 X (m)", "목표 Y (m)", "목표 Z (m)"),
+            ("target_x", "target_y", "target_z"),
+            (-MAP_LIMIT, -MAP_LIMIT, 0.), (MAP_LIMIT, MAP_LIMIT, MAX_ALTITUDE),
+        )
+    ]
+    disabled = (mission.stage not in (0, 8) if mode == "DEMO" else not (
+        bridge_client and bridge_client.transform and bridge_client.enable_commands
+        and drone["fresh"] and drone["simulation_ready"]
+    ))
+    if st.button("목표 좌표 전송", disabled=disabled):
+        if mode == "DEMO":
+            try:
+                mission.set_target(local_target(*values))
+                log_mission("목표 좌표 지정", f"DEMO 적용 · X/Y/Z {mission.target} m", drone)
+            except ValueError as error:
+                st.warning(str(error))
+        else:
+            submit_bridge_command("목표 좌표 전송", drone, lambda: bridge_client.send_target(*values))
+    if mode == "DEMO":
+        st.caption(f"DEMO 적용 목표 · {mission.target} m")
+    elif mode == "GAZEBO":
+        bridge_xyz = " / ".join(f"{drone[axis]:.2f}" if drone[axis] is not None else "—" for axis in ("x", "y", "z"))
+        st.caption(f"Bridge ENU X/Y/Z · {bridge_xyz} m")
+        if not bridge_client or bridge_client.transform is None:
+            st.caption("목표 전송 · 좌표 변환 규칙 확인 대기")
+        if bridge_client and not bridge_client.enable_commands:
+            st.caption("HTTP 명령 전송 · 비활성화")
 
 
-detection_mode = st.radio(
-    "FOD 탐지 모드", ["실시간 영상 분석", "이미지 업로드"],
-    horizontal=True, on_change=reset_detection_mode,
-)
-if detection_mode == "실시간 영상 분석":
-    camera_col, summary_col = st.columns([1.35, 1], gap="medium")
-    with camera_col:
-        video_processor, video_reason = render_video_stream(make_snapshot_saver())
-        video_connection = st.empty()
-    video_summary = summary_col.empty()
+def render_status_strip(drone, mission):
+    flight_mode = STAGES[mission.stage] if mode == "DEMO" else drone["flight_mode"]
+    armed = 0 < mission.stage < 8 if mode == "DEMO" else drone["armed"]
+    chips = (
+        ("시스템", drone["connection"]), ("데이터 모드", mode), ("비행 모드", flight_mode or "—"),
+        ("Armed", "—" if armed is None else "ARMED" if armed else "DISARMED"),
+        ("GPS / 위성", f'{drone["gps"] or "—"} / {drone["satellites"] if drone["satellites"] is not None else "—"}'),
+        ("배터리", f'{drone["battery"]}%' if drone["battery"] is not None else "—"),
+        ("MAVLink", drone["mavlink"] or "미연동"), ("시스템 시간", datetime.now(KST).strftime("%H:%M:%S KST")),
+    )
+    with st.container(key="system_cards"):
+        for column, (label, value) in zip(st.columns(len(chips)), chips):
+            column.metric(label, value)
+    st.caption(drone["source"])
 
-monitoring_panel()
+
+def render_telemetry(drone, mission, camera):
+    left, right = st.columns([1.5, 1])
+    with left:
+        st.subheader("실시간 드론 정보")
+        st.caption(drone["source"])
+        metrics = (
+            ("드론 ID", drone["id"]), ("위도", drone["latitude"]), ("경도", drone["longitude"]),
+            ("고도", f'{drone["altitude_m"]:g} m' if drone["altitude_m"] is not None else None),
+            ("속도", f'{drone["speed"]:g} m/s' if drone["speed"] is not None else None),
+            ("Roll / Pitch / Yaw", " / ".join(str(drone[axis]) if drone[axis] is not None else "—"
+                                            for axis in ("roll", "pitch", "yaw"))),
+            ("배터리 잔량", f'{drone["battery"]}%' if drone["battery"] is not None else None),
+            ("전압", f'{drone["voltage"]:g} V' if drone["voltage"] is not None else None),
+            ("비행 모드", STAGES[mission.stage] if mode == "DEMO" else drone["flight_mode"]), ("GPS", drone["gps"]),
+        )
+        with st.container(key="drone_cards"):
+            for row in (metrics[:5], metrics[5:]):
+                for column, (label, value) in zip(st.columns(5), row):
+                    column.metric(label, "—" if value is None else value)
+    with right:
+        st.subheader("시스템 상태")
+        st.write(f"YOLO 모델 · {'가중치 준비' if weights.is_file() else '가중치 없음'}")
+        st.write(f"카메라 · {camera}")
+        if mode == "GAZEBO":
+            st.write(f'Bridge · {drone["connection"]}')
+            if drone["error"]:
+                st.caption(f'Bridge 상태 코드 · {drone["error"]}')
+            st.write(f'시뮬레이션 준비 · {"확인" if drone["simulation_ready"] else "대기"}')
+            if drone["camera_stream_url"]:
+                st.caption("Bridge 하향 영상 주소 · 수신됨 · 분석 미연동")
+                st.code(drone["camera_stream_url"], language=None)
+            else:
+                st.caption("Bridge 하향 영상 주소 · 미수신")
+        else:
+            st.write("MAVSDK / PX4 SITL / Gazebo · 미연동")
+        st.write(f"AI 처리 컴퓨터 · {platform.system()} · Jetson 미연동")
+
+
+@st.fragment(run_every="1s")
+def render_operations():
+    mission = st.session_state["demo_mission"]
+    now = time.monotonic()
+    drone = (provider.read(simulation_elapsed()) if provider is not None
+             else unavailable_telemetry("미연동", error=bridge_config_error))
+    video_mode = detection_mode == "실시간 영상 분석"
+    detection, reason = (video_processor.snapshot() if video_mode and video_processor is not None
+                         else (None, video_reason if video_mode else "착륙 판단에는 최신 카메라 분석이 필요합니다."))
+    camera = (video_processor.connection_status() if video_mode and video_processor is not None
+              else reason if video_mode else "이미지 업로드 모드")
+    camera_event = None
+    if video_mode and camera == VIDEO_STOPPED:
+        camera_event = "카메라 종료" if video_processor is None else "통신 오류"
+    elif video_mode and "중단되었습니다" in camera:
+        camera_event = "통신 오류"
+    if camera_event and camera_event != st.session_state.get("camera_event"):
+        log_mission(camera_event, f"카메라 · {camera}", drone)
+    st.session_state["camera_event"] = camera_event
+    bridge_error = drone["error"] if mode == "GAZEBO" else None
+    if bridge_error and bridge_error != st.session_state.get("last_bridge_error"):
+        log_mission("Bridge 통신 오류", bridge_error, drone)
+    st.session_state["last_bridge_error"] = bridge_error
+    left, center = st.columns([1, 2.7], gap="medium")
+    with left:
+        if mode == "DEMO":
+            render_mission(mission, drone, now)
+        elif mode == "GAZEBO" and bridge_client and bridge_client.mock:
+            st.checkbox("Mock 패드 확인", key="bridge_pad_confirmed")
+        elif mode == "REAL":
+            st.info("REAL · 미연동")
+    mock_bridge = mode == "GAZEBO" and bridge_client is not None and bridge_client.mock
+    pad_confirmed = mission.pad_confirmed if mode == "DEMO" else (
+        mock_bridge and st.session_state.get("bridge_pad_confirmed", False)
+    )
+    vehicle_ready = mission.prechecked if mode == "DEMO" else (
+        mock_bridge and drone["fresh"] and drone["armed"] is True and drone["id"] is not None
+        and drone["battery"] is not None and drone["emergency"] is False
+    )
+    communication_ready = video_mode and detection is not None and (
+        mode == "DEMO" or (mock_bridge and drone["fresh"] and drone["simulation_ready"])
+    )
+    outcome = evaluate_fod_landing(
+        detection, pad_confirmed=pad_confirmed,
+        telemetry_ready=vehicle_ready, communication_ready=communication_ready,
+        battery=drone["battery"], emergency=drone["emergency"], unavailable_reason=reason,
+    )
+    if mode == "DEMO":
+        if event := mission.tick(now, outcome["status"]):
+            log_mission(*event, drone)
+    elif mode == "GAZEBO":
+        with left:
+            render_bridge_controls(drone, outcome)
+    with header_slot.container():
+        render_status_strip(drone, mission)
+    if video_mode:
+        record_fod_state(detection, drone["id"], drone["battery"], detection_mode, reason)
+    record_decision_change(outcome["status"], outcome["reason"], drone["id"], drone["battery"],
+                           detection, outcome["alert_level"])
+    with center:
+        render_target(mission, drone, now, detection, outcome)
+        if mode == "GAZEBO" and (result := st.session_state.get("bridge_command_result")):
+            (st.success if result[0] else st.warning)(result[1])
+    with ai_slot.container():
+        if video_mode:
+            timing = "—" if not detection else f'{detection["processing_ms"]:.0f} ms'
+            timestamp = "—" if not detection else detection["analyzed_at"].astimezone(KST).strftime("%H:%M:%S KST")
+            with st.container(key="fod_cards"):
+                count, score, duration = st.columns(3)
+                count.metric("FOD 탐지", f'{detection["fod_count"]}개' if detection else "미확인")
+                score.metric("최고 신뢰도", f'{detection["confidence"]:.1%}' if detection and detection["confidence"] is not None else "—")
+                duration.metric("AI 처리시간", timing)
+            fod_status = "미확인" if detection is None else "탐지" if detection["fod_detected"] else "미탐지"
+            st.caption(f"FOD 상태 · {fod_status}")
+            st.caption(f"마지막 유효 분석 · {timestamp} · {camera}")
+            if video_processor is not None and (error := video_processor.snapshot_error()):
+                st.warning(error)
+        status = outcome["status"]
+        st.markdown(
+            f'<div class="control-card {status.lower()}"><small>착륙 안전 판단 · {mode}</small>'
+            f'<strong>{status}</strong>{escape(outcome["reason"])}</div>', unsafe_allow_html=True,
+        )
+        alert = outcome["alert_level"] if drone["battery"] is not None and drone["emergency"] is not None else "미확인"
+        st.caption(f"기체 경고 · {alert}  /  패드 위치 · " + ("확인" if pad_confirmed else "확인 대기"))
+    with telemetry_slot.container():
+        render_telemetry(drone, mission, camera)
+
+
+@st.fragment(run_every="1s")
+def render_image_panel():
+    with st.container(key="image_fod_cards"):
+        detection = render_fod_detection(weights, KST)
+    if isinstance(provider, GazeboTelemetryProvider):
+        drone = provider.latest()
+    else:
+        drone = provider.read(simulation_elapsed()) if provider is not None else unavailable_telemetry("미연동")
+    record_fod_state(detection, drone["id"], drone["battery"],
+                     "이미지 업로드", "유효한 이미지 분석 결과 없음")
+
+
+if "demo_mission" not in st.session_state:
+    st.session_state["demo_mission"] = DemoMission()
+if "twin_trace" not in st.session_state:
+    st.session_state["twin_trace"] = TwinTrace()
+for key, value in zip(("target_x", "target_y", "target_z"), st.session_state["demo_mission"].target):
+    st.session_state.setdefault(key, value)
+
+def clear_bridge_session():
+    for key in ("bridge_command_result", "bridge_pad_confirmed", "bridge_provider"):
+        st.session_state.pop(key, None)
+
+
+st.title("스마트 버티포트 통합 관제")
+mode = st.radio("데이터 모드", ["DEMO", "GAZEBO", "REAL"], horizontal=True, on_change=clear_bridge_session)
+provider, bridge_client, bridge_config_error = None, None, None
+if mode == "DEMO":
+    provider = (DemoTelemetry(scenario=SIMULATION_SCENARIOS[scenario_label]) if data_source == "simulation"
+                else DemoTelemetry(manual={"id": "DRONE-01", "battery": manual_battery,
+                                           "altitude_m": manual_altitude, "emergency": manual_emergency}))
+elif mode == "GAZEBO":
+    mock_bridge = st.checkbox("Mock Bridge", on_change=clear_bridge_session)
+    mock_transform = mock_bridge and st.checkbox("Mock 테스트 좌표 변환 사용", on_change=clear_bridge_session)
+    try:
+        if "bridge_provider" not in st.session_state:
+            transform = None
+            if mock_transform:
+                transform = CoordinateTransform(90, (10, -2, 1))
+            elif not mock_bridge and (raw := os.getenv("VERTIPORT_BRIDGE_TRANSFORM")):
+                transform = CoordinateTransform.from_json(raw)
+            bridge = GazeboBridgeClient(
+                mock=mock_bridge, transform=transform,
+                enable_commands=os.getenv("VERTIPORT_BRIDGE_ENABLE_COMMANDS") == "1",
+            )
+            st.session_state["bridge_provider"] = GazeboTelemetryProvider(bridge)
+        provider = st.session_state["bridge_provider"]
+        bridge_client = provider.client
+    except (BridgeError, ValueError, OverflowError) as error:
+        bridge_config_error = getattr(error, "code", "INVALID_TRANSFORM")
+        st.warning(f"Bridge 설정 확인 · {error}")
+header_slot = st.empty()
+operations_col, camera_col = st.columns([2.6, 1.3], gap="medium")
+with camera_col:
+    detection_mode = st.radio("FOD 탐지 모드", ["실시간 영상 분석", "이미지 업로드"],
+                              horizontal=True, on_change=reset_detection_mode)
+    if detection_mode == "실시간 영상 분석":
+        video_processor, video_reason = render_video_stream(make_snapshot_saver(provider))
+    else:
+        render_image_panel()
+    ai_slot = st.empty()
+telemetry_slot = st.empty()
+with operations_col:
+    render_operations()
 render_history()
-
-st.caption(
-    "주의: YOLO 모델은 FOD 클래스만 학습한 모델을 사용합니다. "
-    "다른 객체 탐지를 수행하지 않으며, 미탐지 결과가 실제 착륙장 안전을 보장하지는 않습니다. "
-    "이미지 분석 완료 시각으로 사진 촬영 시각을 확인할 수 없습니다."
-)
