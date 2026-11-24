@@ -51,6 +51,8 @@ def save_event(
     status="",
     description="",
     log_path=LOG_FILE,
+    *,
+    occurred_at=None,
 ):
     """CSV에 이벤트를 저장합니다. 반환 형식은 이전 버전과 동일합니다.
 
@@ -58,9 +60,10 @@ def save_event(
     FOD 분석 이벤트는 사용자가 재분석할 때마다 별도로 저장합니다.
     """
     now = datetime.now(KST)
+    occurred_at = now if occurred_at is None else occurred_at.astimezone(KST)
     log_path = Path(log_path)
     event = {
-        "시간": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "시간": occurred_at.strftime("%Y-%m-%d %H:%M:%S"),
         "이벤트": event_type,
         "드론 ID": drone_id,
         "FOD 개수": "" if fod_count is None else fod_count,
@@ -90,4 +93,4 @@ def load_events(limit=30, log_path=LOG_FILE):
     with _LOG_LOCK:
         with log_path.open("r", newline="", encoding="utf-8-sig") as file:
             rows = list(csv.DictReader(file))
-    return list(reversed(rows))[:limit]
+    return sorted(reversed(rows), key=lambda row: row.get("시간") or "", reverse=True)[:limit]

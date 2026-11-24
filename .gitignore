@@ -1,2 +1,5 @@
 
 __pycache__/
+/vertiport_dashboard/logs/
+/vertiport_dashboard/data/fod_snapshots/*
+!/vertiport_dashboard/data/fod_snapshots/README.md

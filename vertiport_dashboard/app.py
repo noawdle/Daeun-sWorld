@@ -20,6 +20,7 @@ import streamlit as st
 from fod_detection import get_model, model_identity, render_fod_detection
 from event_logger import LOG_FILE, load_events, save_event
 from drone_simulator import get_drone_state
+from fod_snapshots import SNAPSHOT_DIR, load_snapshots, save_snapshot
 from video_detection import VIDEO_IDLE, VIDEO_STOPPED, VideoAnalysis
 
 ROOT = Path(__file__).resolve().parent
@@ -218,8 +219,12 @@ def render_condition_chips(detection, pad_occupied, emergency, data_source):
     )
     emergency_tone = "danger" if emergency else "neutral"
 
-    chips = ((fod_label, fod_tone), (pad_label, pad_tone),
-             (emergency_label, emergency_tone))
+    chips = (
+        (fod_label, fod_tone), (pad_label, pad_tone),
+        ("사람 · 있음" if person_detected else "사람 · 없음", "danger" if person_detected else "neutral"),
+        ("차량 · 있음" if vehicle_detected else "차량 · 없음", "danger" if vehicle_detected else "neutral"),
+        (emergency_label, emergency_tone),
+    )
     chips_html = "".join(
         f'<span class="landing-chip landing-chip--{tone}">{escape(label)}</span>'
         for label, tone in chips
@@ -235,11 +240,11 @@ st.set_page_config(
 st.markdown(
     """<style>
     .stApp {background: #f5f7fb;}
-    .block-container {padding-top: 1.6rem; max-width: 1500px;}
+    .block-container {padding-top: 1.1rem; max-width: 1500px;}
     h1, h2, h3 {color: #14243c;}
     [data-testid="stMetric"] {
         background: white; border: 1px solid #e3e9f2;
-        border-radius: 12px; padding: 18px;
+        border-radius: 12px; padding: 9px 12px;
     }
     /* STEP 5-4: 요약 상태 카드와 주요 지표가 상단에서 균형 있게 보이도록 조정합니다. */
     .top-summary-title {font-size: 18px; font-weight: 700; color: #14243c; margin: 0 0 9px;}
@@ -363,12 +368,7 @@ with st.sidebar:
     st.caption("FOD 여부는 선택한 입력의 YOLO 탐지 결과로 결정합니다.")
 
 st.title("스마트 버티포트 통합 모니터링")
-st.caption("YOLO FOD 탐지 · 단일 드론 상태 · 착륙 판단 알고리즘")
-st.info(
-    "시뮬레이션 전용 화면입니다. 드론 상태는 직접 설정하거나 프로그램에서 생성하며, "
-    "사람·차량·착륙장 점유는 직접 설정합니다. "
-    "실제 드론 통신이나 착륙 허가가 아닙니다."
-)
+st.caption("시뮬레이션 · 단일 드론 상태 및 착륙장 FOD 관제")
 
 team_weights = PROJECT_ROOT / "train_model" / "weights" / "best.pt"
 standalone_weights = ROOT / "models" / "best.pt"
@@ -384,10 +384,9 @@ def reset_detection_mode():
     st.session_state.pop("fod_video_was_playing", None)
 
 
-def render_video_stream():
+def render_video_stream(save_detection):
     """연결 컴포넌트는 폴링 fragment 밖에서 렌더링합니다."""
-    st.subheader("착륙 패드 실시간 영상 분석")
-    st.caption("START로 카메라 연결, STOP으로 분석을 종료합니다. 카메라 권한을 허용해 주세요.")
+    st.subheader("실시간 카메라")
     try:
         from streamlit_webrtc import WebRtcMode, webrtc_streamer
     except ImportError:
@@ -396,8 +395,8 @@ def render_video_stream():
     if not weights.is_file():
         return None, f"YOLO 가중치를 찾지 못했습니다. 경로 · {weights}"
     model = get_model(model_identity(weights))
-    st.caption(f"사용 모델 · {weights.parent.name}/{weights.name}")
     with st.expander("영상 분석 설정"):
+        st.caption(f"사용 모델 · {weights.parent.name}/{weights.name}")
         threshold = st.slider("최소 탐지 신뢰도", 0.05, 0.95, 0.25, 0.05, key="video_threshold")
         interval = st.number_input("분석 간격 (초)", 0.2, 5.0, 0.5, 0.1)
         image_size = st.selectbox("YOLO 입력 크기", [320, 480, 640], index=2)
@@ -405,17 +404,26 @@ def render_video_stream():
     if max_age <= interval:
         st.warning("분석 간격보다 유효시간을 길게 설정하면 분석 사이의 판단 보류를 줄일 수 있습니다.")
     settings = (model, threshold, interval, image_size, max_age)
+    mounted_context = st.session_state.get("active_fod_video")
+    if mounted_context is not None:
+        # streamlit-webrtc 0.79.1 can count intervening reruns as a remount.
+        # This page clears the mount marker when the user leaves video mode.
+        mounted_context._last_rendered_run_count = None
     context = webrtc_streamer(
         key="fod_video_stream",
         mode=WebRtcMode.SENDRECV,
         media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=lambda: VideoAnalysis(*settings),
+        video_processor_factory=lambda: VideoAnalysis(*settings, save_detection=save_detection),
+        video_html_attrs={
+            "autoPlay": True, "controls": False, "muted": True, "playsInline": True,
+            "style": {"width": "100%", "height": "auto", "maxHeight": "320px", "objectFit": "contain"},
+        },
         async_processing=False,
     )
     st.session_state["active_fod_video"] = context
     processor = context.video_processor
     if processor is not None:
-        processor.configure(settings)
+        processor.configure(settings, save_detection)
     if context.state.playing:
         st.session_state["fod_video_was_playing"] = True
         return processor, "카메라 프레임을 기다리는 중입니다."
@@ -426,12 +434,32 @@ def render_video_stream():
     return None, VIDEO_IDLE
 
 
-detection_mode = st.radio(
-    "FOD 탐지 모드", ["이미지 업로드", "실시간 영상 분석"],
-    horizontal=True, on_change=reset_detection_mode,
-)
-if detection_mode == "실시간 영상 분석":
-    video_processor, video_reason = render_video_stream()
+def make_snapshot_saver():
+    """캡처 시점의 기체·환경 입력으로 판단해 저장하는 작업을 만듭니다."""
+    elapsed = simulation_elapsed()
+    baseline = time.monotonic()
+    running = st.session_state["sim_running"]
+    scenario = SIMULATION_SCENARIOS[scenario_label] if data_source == "simulation" else None
+    manual = None if scenario else {
+        "id": "DRONE-01", "battery": manual_battery, "emergency": manual_emergency,
+        "landing_requested": manual_landing_requested,
+    }
+    environment = (person_detected, vehicle_detected, pad_occupied)
+
+    def persist(image, boxes, received, captured_at):
+        drone = manual
+        if scenario:
+            offset = max(0, received - baseline) if running else 0
+            drone = get_drone_state(min(SIMULATION_MAX_SECONDS, elapsed + offset), scenario=scenario)
+        detection = {"fod_detected": True, "fod_count": len(boxes),
+                     "confidence": max(score for _, score in boxes)}
+        outcome = evaluate_current_state(
+            detection, drone["id"], drone["battery"], drone["emergency"],
+            drone["landing_requested"], *environment, record=False,
+        )
+        save_snapshot(image, captured_at, detection, drone, outcome["status"])
+
+    return persist
 
 
 @st.fragment(run_every="1s")
@@ -458,32 +486,37 @@ def monitoring_panel():
         flight_phase = "직접 설정"
         time_label = ""
 
-    # 이 영역을 먼저 확보해 두면 FOD 분석 후 계산한 판단 상태를
-    # 화면 맨 위에 요약 카드로 보여줄 수 있습니다.
-    summary_slot = st.empty()
+    if detection_mode == "이미지 업로드":
+        image_col, summary_col = st.columns([1.35, 1], gap="medium")
+        summary_slot = summary_col.empty()
+    else:
+        summary_slot = video_summary
+    col_detect, col_decision = st.columns([1.35, 1], gap="medium")
 
-    st.divider()
-    col_detect, col_decision = st.columns([1.25, 1], gap="large")
-
-    with col_detect:
-        if detection_mode == "이미지 업로드":
+    if detection_mode == "이미지 업로드":
+        with image_col:
             detection = render_fod_detection(weights, KST)
             unavailable_reason = (
                 "YOLO 이미지 추론에 실패했습니다." if "fod_error" in st.session_state
                 else "유효한 이미지 분석 결과가 없습니다."
             )
-        else:
-            st.subheader("실시간 FOD 탐지 결과")
-            detection, unavailable_reason = (
-                video_processor.snapshot() if video_processor is not None else (None, video_reason)
-            )
-            if detection is None:
-                st.info(unavailable_reason)
-            else:
-                count_col, score_col = st.columns(2)
-                count_col.metric("FOD 탐지 수", f'{detection["fod_count"]}개')
-                score = detection["confidence"]
-                score_col.metric("최고 탐지 신뢰도", "—" if score is None else f"{score:.1%}")
+    else:
+        detection, unavailable_reason = (
+            video_processor.snapshot() if video_processor is not None else (None, video_reason)
+        )
+        video_connection.caption(video_processor.connection_status() if video_processor else video_reason)
+
+    with col_detect:
+        st.subheader("실시간 FOD 탐지 결과" if detection_mode == "실시간 영상 분석" else "이미지 FOD 탐지 결과")
+        count_col, score_col = st.columns(2)
+        count_col.metric("FOD 탐지 수", f'{detection["fod_count"]}개' if detection else "미확인")
+        score = detection["confidence"] if detection else None
+        score_col.metric("최고 탐지 신뢰도", "—" if score is None else f"{score:.1%}")
+        st.caption(unavailable_reason if detection is None else
+                   ("FOD 탐지" if detection["fod_detected"] else "FOD 미탐지"))
+        if detection_mode == "실시간 영상 분석" and video_processor is not None:
+            if error := video_processor.snapshot_error():
+                st.warning(error)
 
     record_fod_state(detection, drone_id, battery, detection_mode, unavailable_reason)
 
@@ -497,11 +530,9 @@ def monitoring_panel():
                     unsafe_allow_html=True)
         source_label = "드론 시뮬레이션 데이터" if data_source == "simulation" else "직접 설정 데이터"
         st.caption(f"{drone_id} · 단일 드론 · {source_label} · 비행 단계: {flight_phase}{time_label}")
-        col_status, col_battery, col_altitude, col_fod = st.columns(
-            [2.0, 1, 1, 1], gap="small"
-        )
-        with col_status:
-            render_status_card(outcome["status"])
+        render_status_card(outcome["status"])
+        col_battery, col_altitude = st.columns(2, gap="small")
+        col_fod, col_emergency = st.columns(2, gap="small")
         with col_battery:
             st.metric("배터리", f"{battery}%")
         with col_altitude:
@@ -509,10 +540,8 @@ def monitoring_panel():
         with col_fod:
             st.metric("FOD 탐지", "미확인" if detection is None
                       else f'{detection["fod_count"]}개')
-        st.caption(
-            f"FOD 입력은 {detection_mode}이며, 배터리·고도는 {source_label}입니다. "
-            "착륙장 조건은 직접 선택한 값입니다. 실제 착륙 허가가 아닙니다."
-        )
+        col_emergency.metric("긴급 상태", "발생" if emergency else "없음")
+        st.info("권고 조치 · " + outcome["recommended_action"])
 
     with col_decision:
         st.subheader("판단 근거 및 권고 조치")
@@ -540,40 +569,103 @@ def monitoring_panel():
             with st.expander("판단 입출력 확인"):
                 st.json(outcome["debug"])
 
-    # 과거처럼 모든 이벤트 기록을 길게 펼치지 않고 최근 8건만 먼저 표시합니다.
-    # 상세 기록은 확장 영역에서 확인할 수 있으며 다운로드는 전체 CSV입니다.
+
+@st.fragment(run_every="5s")
+def render_history():
     st.divider()
     col_title, col_info = st.columns([2, 1], gap="small")
     with col_title:
         st.subheader("최근 이벤트 기록")
     with col_info:
         st.caption("이미지 분석 · FOD 상태 변경 · 착륙 판단 변경 자동 기록")
+    photos = load_snapshots()
+    photos_by_name = {record["photo"]: record for record in photos}
     try:
-        recent = load_events(limit=8)
-        if recent:
-            st.dataframe(recent, hide_index=True, width="stretch", height=305)
-            with st.expander("이전 이벤트 기록 30건 보기"):
-                st.dataframe(load_events(limit=30), hide_index=True, width="stretch")
-                st.caption("직접 실행한 테스트 기록도 포함될 수 있습니다.")
+        events = load_events(limit=None)
+    except (OSError, csv.Error) as error:
+        st.warning(f"이벤트 기록 불러오기 실패: {error}")
+        events = []
+    linked = {event["상세 내용"] for event in events if event["이벤트"] == "FOD 사진 저장"}
+    for photo in photos:
+        if photo["photo"] not in linked:
+            events.append({
+                "시간": photo["captured_at"][:19].replace("T", " "), "이벤트": "FOD 사진 저장",
+                "드론 ID": photo["drone_id"], "FOD 개수": photo["fod_count"],
+                "배터리 (%)": photo.get("battery", ""), "착륙 판단": photo["status"],
+                "상세 내용": photo["photo"],
+            })
+    events.sort(key=lambda event: event["시간"], reverse=True)
+    for event in events[:30]:
+        photo = photos_by_name.get(event["상세 내용"]) if event["이벤트"] == "FOD 사진 저장" else None
+        event["최고 신뢰도"] = f'{photo["confidence"]:.1%}' if photo else ""
+        event["사진"] = photo["photo"] if photo else ""
+    if events:
+        st.dataframe(events[:8], hide_index=True, width="stretch", height=305)
+        with st.expander("최근 이벤트 30건 보기"):
+            st.dataframe(events[:30], hide_index=True, width="stretch")
+    else:
+        st.info("아직 기록된 이벤트가 없습니다.")
+    if LOG_FILE.is_file():
+        try:
             st.download_button(
                 "전체 이벤트 CSV 다운로드",
                 data=LOG_FILE.read_bytes(),
                 file_name="vertiport_event_log.csv",
                 mime="text/csv",
                 key="download_event_log_csv",
+                on_click="ignore",
             )
-        else:
-            st.info("아직 기록된 이벤트가 없습니다. FOD 분석을 실행해 주세요.")
-    except (OSError, csv.Error) as error:
-        st.warning(f"이벤트 기록 불러오기 실패: {error}")
+        except OSError as error:
+            st.warning(f"CSV 다운로드 준비 실패 · {error}")
+    render_gallery(photos)
+
+
+def render_gallery(photos):
+    st.subheader("자동 저장된 FOD 탐지 사진")
+    if not photos:
+        st.info("저장된 FOD 탐지 사진이 없습니다.")
+        return
+    selection_key = "gallery_selected_photo"
+    for column, photo in zip(st.columns(3), photos[:3]):
+        with column, st.container(border=True):
+            try:
+                st.image((SNAPSHOT_DIR / photo["photo"]).read_bytes(), width="stretch")
+                st.caption(photo_caption(photo))
+                st.button(
+                    "사진 크게 보기", key=f"open_{photo['photo']}",
+                    on_click=st.session_state.update, args=({selection_key: photo["photo"]},),
+                )
+            except OSError as error:
+                st.warning(f"사진을 불러올 수 없습니다 · {error}")
+    with st.expander("전체 탐지 이력 및 사진 상세"):
+        by_name = {photo["photo"]: photo for photo in photos}
+        name = st.selectbox(
+            "탐지 사진 선택", list(by_name), index=None, key=selection_key,
+            format_func=lambda filename: f"{photo_caption(by_name[filename])} · {filename[-12:-4]}",
+        )
+    if name:
+        try:
+            jpeg = (SNAPSHOT_DIR / name).read_bytes()
+            st.image(jpeg, caption=photo_caption(by_name[name]), width="stretch")
+            st.download_button("탐지 사진 다운로드", jpeg, name, "image/jpeg", on_click="ignore")
+        except OSError as error:
+            st.warning(f"사진을 불러올 수 없습니다 · {error}")
+
+
+def photo_caption(photo):
+    time_label = photo["captured_at"][:19].replace("T", " ")
+    return (f'{time_label} KST · {photo["drone_id"]} · FOD {photo["fod_count"]}개 · '
+            f'{photo["confidence"]:.1%} · {photo["status"]}')
 
 
 def evaluate_current_state(detection, drone_id, battery, emergency,
                            landing_requested, person_detected, vehicle_detected,
-                           pad_occupied, unavailable_reason="유효한 FOD 탐지 결과가 없습니다."):
+                           pad_occupied, unavailable_reason="유효한 FOD 탐지 결과가 없습니다.",
+                           *, record=True):
     """직접 설정/시뮬레이션 데이터에 동일한 판단 규칙을 적용합니다."""
+    log_decision = record_decision_change if record else lambda *args: None
     if detection is None:
-        record_decision_change(
+        log_decision(
             "판단 확인 필요", unavailable_reason,
             drone_id, battery,
         )
@@ -588,7 +680,7 @@ def evaluate_current_state(detection, drone_id, battery, emergency,
         }
 
     if not landing_requested:
-        record_decision_change(
+        log_decision(
             "요청 없음", "착륙 요청이 없어 판단 미실행",
             drone_id, battery, detection,
         )
@@ -624,7 +716,7 @@ def evaluate_current_state(detection, drone_id, battery, emergency,
         if not isinstance(result.get("recommended_action"), str):
             raise ValueError("권고 조치 오류")
     except Exception as error:
-        record_decision_change(
+        log_decision(
             "판단 확인 필요", f"착륙 판단 처리 오류: {error}",
             drone_id, battery, detection,
         )
@@ -639,7 +731,7 @@ def evaluate_current_state(detection, drone_id, battery, emergency,
         }
 
     status = result["status"]
-    record_decision_change(
+    log_decision(
         status, result["reason"], drone_id, battery,
         detection, result["alert_level"],
     )
@@ -661,7 +753,19 @@ def evaluate_current_state(detection, drone_id, battery, emergency,
     }
 
 
+detection_mode = st.radio(
+    "FOD 탐지 모드", ["실시간 영상 분석", "이미지 업로드"],
+    horizontal=True, on_change=reset_detection_mode,
+)
+if detection_mode == "실시간 영상 분석":
+    camera_col, summary_col = st.columns([1.35, 1], gap="medium")
+    with camera_col:
+        video_processor, video_reason = render_video_stream(make_snapshot_saver())
+        video_connection = st.empty()
+    video_summary = summary_col.empty()
+
 monitoring_panel()
+render_history()
 
 st.caption(
     "주의: YOLO 모델은 FOD 클래스만 학습한 모델을 사용합니다. "
