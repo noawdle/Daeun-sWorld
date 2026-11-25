@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sdf version="1.9">
+  <!-- 이륙 대기 위치 (스폰 지점). 착륙패드와 헷갈리지 않도록 H 표식 없음. -->
+  <model name="vp_stand">
+    <static>true</static>
+    <link name="base">
+      <visual name="stand">
+        <pose>0 0 0.002 0 0 0</pose>
+        <geometry><plane><normal>0 0 1</normal><size>2 2</size></plane></geometry>
+        <material>
+          <ambient>0.55 0.55 0.58 1</ambient>
+          <diffuse>0.55 0.55 0.58 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

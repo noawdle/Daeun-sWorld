@@ -1,0 +1,74 @@
+# 안전 시나리오 정의 (좌표: World ENU [m], 원점 = 착륙패드 중심, 패드 크기 3 m x 3 m)
+#
+# 객체 타입 → Gazebo 모델. 기본은 오프라인용 단순 모델(sim/models/vp_*).
+# AI 모델이 단순 도형을 사람/차량으로 인식하지 못하면 Gazebo Fuel 의 사실적인 모델로 교체:
+#   person:  https://fuel.gazebosim.org/1.0/OpenRobotics/models/Casual female
+#   vehicle: https://fuel.gazebosim.org/1.0/OpenRobotics/models/Hatchback
+# (Fuel 모델은 첫 실행 시 인터넷에서 내려받음. 이름은 app.gazebosim.org 에서 확인)
+models:
+  person: model://vp_person
+  vehicle: model://vp_vehicle
+  fod: model://vp_fod
+
+scenarios:
+  S0_clear:
+    description: "정상 - 위험요소 없음 → 착륙 가능"
+    objects: []
+
+  S1_person:
+    description: "패드 근처 사람 → 대기(HOLD)"
+    objects:
+      - {id: person_1, type: person, x: 2.5, y: 1.5, yaw: 0.8}
+
+  S2_vehicle:
+    description: "패드 접근로 차량 → 접근 제한"
+    objects:
+      - {id: vehicle_1, type: vehicle, x: 5.0, y: -3.0, yaw: 1.57}
+
+  S3_fod:
+    description: "패드 위 FOD → 착륙 금지"
+    objects:
+      - {id: fod_1, type: fod, x: 0.6, y: -0.4, yaw: 0.3}
+
+  S4_fod_edge:
+    description: "패드 가장자리 FOD (경계 판정 테스트)"
+    objects:
+      - {id: fod_1, type: fod, x: 1.7, y: 0.2, yaw: 0.0}
+
+  S5_mixed:
+    description: "사람 + 차량 + FOD 동시"
+    objects:
+      - {id: person_1, type: person, x: 2.5, y: 1.5, yaw: 0.8}
+      - {id: vehicle_1, type: vehicle, x: 5.0, y: -3.0, yaw: 1.57}
+      - {id: fod_1, type: fod, x: 0.6, y: -0.4, yaw: 0.3}
+
+  S6_person_far:
+    description: "멀리 있는 사람 (오탐 방지 테스트) → 착륙 가능"
+    objects:
+      - {id: person_1, type: person, x: 9.0, y: 7.0, yaw: 0.0}
+
+# 시퀀스: 순서대로 실행. apply / wait_s / wait_alt_below / wait_alt_above
+sequences:
+  # 착륙 하강 중 사람 진입 → HOLD → 사람 이탈 → 착륙 재개
+  demo_person_hold:
+    - apply: S0_clear
+    - wait_alt_above: 3.5       # 이륙 완료 대기 (지상에서 바로 트리거되지 않도록)
+    - wait_alt_below: 3.0       # 착륙 하강 시작 대기
+    - apply: S1_person
+    - wait_s: 8
+    - apply: S0_clear
+
+  # 패드 위 FOD → 착륙 금지 → FOD 제거 → 착륙
+  demo_fod:
+    - apply: S3_fod
+    - wait_s: 20
+    - apply: S0_clear
+
+  # 접근 중 차량 진입 → 접근 제한 → 차량 이탈
+  demo_vehicle:
+    - apply: S0_clear
+    - wait_alt_above: 3.5
+    - wait_s: 3
+    - apply: S2_vehicle
+    - wait_s: 10
+    - apply: S0_clear

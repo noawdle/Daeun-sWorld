@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vertiport HTTP Bridge Viewer (인터페이스 점검용)</title>
+<style>
+  :root { --bg:#0f1216; --panel:#171b21; --line:#2a3039; --text:#e6e9ee; --mute:#8b95a3;
+          --ok:#3fb950; --hold:#d29922; --restr:#db6d28; --nol:#f85149; --acc:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI","Noto Sans KR",sans-serif;
+         background:var(--bg); color:var(--text); display:grid; grid-template-columns:1fr 360px; height:100vh; }
+  main { position:relative; overflow:hidden; }
+  #map { width:100%; height:100%; display:block; cursor:crosshair; }
+  #cam { position:absolute; right:12px; bottom:12px; width:320px; border:1px solid var(--line); border-radius:8px;
+         background:#000; overflow:hidden; }
+  #cam img { width:100%; display:block; min-height:60px; }
+  #cam .cap { font-size:11px; color:var(--mute); padding:4px 8px; display:flex; justify-content:space-between; }
+  aside { background:var(--panel); border-left:1px solid var(--line); padding:14px; overflow:auto; }
+  h1 { font-size:15px; margin:0 0 10px; }
+  .row { display:flex; gap:6px; margin:6px 0; flex-wrap:wrap; }
+  input, select, button { font:inherit; color:var(--text); background:#0f1318; border:1px solid var(--line);
+         border-radius:6px; padding:5px 8px; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  input#base { flex:1; min-width:0; }
+  .kv { display:grid; grid-template-columns:96px 1fr; gap:2px 8px; font-variant-numeric:tabular-nums; margin:8px 0; }
+  .kv div:nth-child(odd) { color:var(--mute); }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:600; font-size:12px; background:#2a3039; }
+  .sec { border-top:1px solid var(--line); margin-top:12px; padding-top:10px; }
+  .sec h2 { font-size:12px; color:var(--mute); margin:0 0 6px; font-weight:600; letter-spacing:.04em; }
+  #log { font:12px/1.4 ui-monospace,Menlo,monospace; color:var(--mute); max-height:220px; overflow:auto; white-space:pre-wrap; }
+  .hint { color:var(--mute); font-size:12px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; background:#555; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="map"></canvas>
+  <div id="cam"><img id="camimg" alt="camera stream"><div class="cap"><span>/camera</span><span id="camstamp">-</span></div></div>
+</main>
+<aside>
+  <h1>Vertiport HTTP Bridge Viewer</h1>
+  <div class="row"><input id="base" placeholder="http://localhost:8080"><button id="conn">연결</button></div>
+  <div class="hint" id="health">-</div>
+
+  <div class="kv">
+    <div>Commander</div><div><span id="state" class="badge">-</span> <span id="phase" class="hint"></span></div>
+    <div>판단</div><div><span id="dec" class="badge">-</span></div>
+    <div>PX4 모드</div><div id="mode">-</div>
+    <div>x, y, z (m)</div><div id="pos">-</div>
+    <div>altitude_m</div><div id="alt">-</div>
+    <div>RPY (deg)</div><div id="rpy">-</div>
+    <div>speed</div><div id="vel">-</div>
+    <div>battery</div><div id="bat">-</div>
+    <div>telemetry_id</div><div id="tid" class="hint">-</div>
+    <div>timestamp</div><div id="ts" class="hint">-</div>
+  </div>
+
+  <div class="sec"><h2>POST /api/command</h2>
+    <div class="row">
+      <button data-cmd='{"command":"set_target","parameters":{"frame":"GAZEBO_WORLD_ENU","x":0,"y":0,"z":4}}'>set_target 패드 상공</button>
+      <button data-cmd='{"command":"set_target","parameters":{"frame":"GAZEBO_WORLD_ENU","x":5,"y":3,"z":4}}'>set_target (5,3,4)</button>
+    </div>
+    <div class="row">
+      <button id="land">request_landing</button>
+      <button data-cmd='{"command":"hover","parameters":{}}'>hover</button>
+      <button data-cmd='{"command":"cancel_mission","parameters":{}}'>cancel_mission</button>
+    </div>
+    <div class="hint">지도 클릭 = 그 지점으로 set_target (현재 z, 최소 2 m). 지상에서 set_target 하면 수직 이륙 후 이동.</div>
+  </div>
+
+  <div class="sec"><h2>POST /api/scenario (테스트용)</h2>
+    <div class="row">
+      <select id="scn">
+        <option>S0_clear</option><option>S1_person</option><option>S2_vehicle</option><option>S3_fod</option>
+        <option>S4_fod_edge</option><option>S5_mixed</option><option>S6_person_far</option>
+      </select>
+      <button id="apply">적용</button>
+    </div>
+    <div class="row">
+      <button data-seq="demo_person_hold">시퀀스: 사람 HOLD</button>
+      <button data-seq="demo_fod">시퀀스: FOD</button>
+      <button data-seq="demo_vehicle">시퀀스: 차량</button>
+    </div>
+  </div>
+
+  <div class="sec"><h2>로그</h2><div id="log"></div></div>
+</aside>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('map'), ctx = cv.getContext('2d');
+let BASE = location.protocol.startsWith('http') ? location.origin : 'http://localhost:8080';
+$('base').value = BASE;
+let tel = null, scene = null, trail = [], timers = [];
+const COLORS = { LAND_OK:'#3fb950', HOLD:'#d29922', RESTRICTED:'#db6d28', NO_LAND:'#f85149' };
+const OBJ = { person:'#ff7b72', vehicle:'#79c0ff', fod:'#e3b341' };
+let view = { cx:-2, cy:0, scale:24 };
+
+function log(s){ const l=$('log'); l.textContent = new Date().toLocaleTimeString()+'  '+s+'\n'+l.textContent.slice(0,5000); }
+async function getJSON(p){ const r = await fetch(BASE+p, {cache:'no-store'}); return r.json(); }
+async function post(p, body){
+  try {
+    const r = await fetch(BASE+p, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const j = await r.json(); log(`${p} ${r.status} ← ${JSON.stringify(j)}`); return j;
+  } catch(e){ log(`${p} 실패: ${e}`); }
+}
+let reqN = 0;
+const cmd = o => post('/api/command', {request_id: `viewer-${Date.now()}-${++reqN}`, ...o});
+
+function start(){
+  BASE = $('base').value.replace(/\/$/, '');
+  timers.forEach(clearInterval); timers = [];
+  $('camimg').src = BASE + '/camera?ts=' + Date.now();
+  timers.push(setInterval(async()=>{ try{ const t = await getJSON('/api/telemetry'); if (t.telemetry_id){ tel=t; trail.push([t.x,t.y]); if(trail.length>800) trail.shift(); panel(); } }catch{} }, 100));
+  timers.push(setInterval(async()=>{ try{ scene = await getJSON('/api/scene'); panel(); }catch{} }, 500));
+  timers.push(setInterval(async()=>{ try{ const h = await getJSON('/api/health');
+    $('health').innerHTML = `<b>${h.status}</b> · ready=${h.simulation_ready} · ` + Object.entries(h.components).map(([k,v])=>`<span class="dot" style="background:${v.ok?'#3fb950':(v.required===false?'#555':'#f85149')}"></span>${k}`).join(' ');
+    const im = h.components.camera; $('camstamp').textContent = im.stamp!=null ? `stamp ${im.stamp.toFixed(2)} s · ${im.fps} fps` : 'no image';
+  }catch(e){ $('health').textContent = '연결 실패: '+BASE; } }, 1000));
+}
+$('conn').onclick = start;
+document.querySelectorAll('[data-cmd]').forEach(b => b.onclick = () => cmd(JSON.parse(b.dataset.cmd)));
+$('land').onclick = () => cmd({command:'request_landing', parameters:{telemetry_id: tel?.telemetry_id}});
+document.querySelectorAll('[data-seq]').forEach(b => b.onclick = () => post('/api/scenario', {op:'sequence', name:b.dataset.seq}));
+$('apply').onclick = () => post('/api/scenario', {op:'apply', name:$('scn').value});
+
+const f = (v,n=2) => v==null ? '-' : v.toFixed(n);
+function panel(){
+  if (tel) {
+    $('state').textContent = tel.flight_mode; $('phase').textContent = tel.ext?.commander?.phase || tel.ext?.commander?.message || '';
+    $('mode').textContent = `${tel.ext?.px4_mode ?? '-'}  ${tel.armed?'ARMED':'disarmed'}${tel.emergency?' · EMERGENCY':''}`;
+    $('pos').textContent = `${f(tel.x)}, ${f(tel.y)}, ${f(tel.z)}`;
+    $('alt').textContent = f(tel.altitude_m);
+    $('rpy').textContent = `${f(tel.roll,1)}, ${f(tel.pitch,1)}, ${f(tel.yaw,1)}`;
+    $('vel').textContent = `${f(tel.speed)} m/s`;
+    $('bat').textContent = tel.battery==null ? 'null' : `${f(tel.battery,1)} % · ${f(tel.voltage)} V`;
+    $('tid').textContent = tel.telemetry_id; $('ts').textContent = tel.timestamp;
+  }
+  const d = scene?.decision;
+  if (d) { $('dec').textContent = `${d.decision} ${d.label_ko||''}`; $('dec').style.background = COLORS[d.decision]||'#2a3039'; $('dec').style.color='#0f1216'; }
+}
+
+function resize(){ cv.width = cv.clientWidth*devicePixelRatio; cv.height = cv.clientHeight*devicePixelRatio; }
+addEventListener('resize', resize); resize();
+const S = () => view.scale*devicePixelRatio;
+const W2C = (x,y) => [cv.width/2 + (x-view.cx)*S(), cv.height/2 - (y-view.cy)*S()];
+const C2W = (px,py) => [view.cx + (px*devicePixelRatio - cv.width/2)/S(), view.cy - (py*devicePixelRatio - cv.height/2)/S()];
+cv.addEventListener('wheel', e => { e.preventDefault(); view.scale = Math.min(140, Math.max(6, view.scale*(e.deltaY<0?1.1:0.9))); }, {passive:false});
+cv.addEventListener('click', e => {
+  const r = cv.getBoundingClientRect(); const [x,y] = C2W(e.clientX-r.left, e.clientY-r.top);
+  const z = Math.max(2, tel?.z ?? 4);
+  cmd({command:'set_target', parameters:{frame:'GAZEBO_WORLD_ENU', x:+x.toFixed(2), y:+y.toFixed(2), z:+z.toFixed(2)}});
+});
+function rect(x,y,w,h,fill,stroke){ const [a,b]=W2C(x-w/2,y+h/2); ctx.fillStyle=fill; ctx.fillRect(a,b,w*S(),h*S()); if(stroke){ctx.strokeStyle=stroke; ctx.lineWidth=2; ctx.strokeRect(a,b,w*S(),h*S());} }
+function draw(){
+  const s = S();
+  ctx.fillStyle = '#26301f'; ctx.fillRect(0,0,cv.width,cv.height);
+  rect(-3,0,30,24,'#2c2f34');
+  ctx.strokeStyle='rgba(255,255,255,.06)'; ctx.lineWidth=1;
+  for (let i=-30;i<=30;i++){ let [a]=W2C(i,0); ctx.beginPath(); ctx.moveTo(a,0); ctx.lineTo(a,cv.height); ctx.stroke(); let [,b]=W2C(0,i); ctx.beginPath(); ctx.moveTo(0,b); ctx.lineTo(cv.width,b); ctx.stroke(); }
+  rect(-6,0,2,2,'#5a5c61');
+  const pad = scene?.landing_pad || {x:0, y:0, size_m:3};
+  rect(pad.x, pad.y, pad.size_m, pad.size_m, '#3a3e44', scene?.decision ? COLORS[scene.decision.decision] : '#e6e9ee');
+  let [px,py]=W2C(pad.x,pad.y); ctx.fillStyle='#e6e9ee'; ctx.font=`bold ${1.6*s}px system-ui`; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('H',px,py);
+  if (pad.perceived?.position_m){ const [a,b]=W2C(pad.perceived.position_m.x,pad.perceived.position_m.y); ctx.strokeStyle='#a371f7'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(a-8,b); ctx.lineTo(a+8,b); ctx.moveTo(a,b-8); ctx.lineTo(a,b+8); ctx.stroke(); }
+  let [ox,oy]=W2C(0,0); ctx.lineWidth=2; ctx.strokeStyle='#f85149'; ctx.beginPath(); ctx.moveTo(ox,oy); ctx.lineTo(ox+2*s,oy); ctx.stroke();
+  ctx.strokeStyle='#3fb950'; ctx.beginPath(); ctx.moveTo(ox,oy); ctx.lineTo(ox,oy-2*s); ctx.stroke();
+  ctx.font=`${12*devicePixelRatio}px system-ui`; ctx.fillStyle='#8b95a3'; ctx.textAlign='left'; ctx.fillText('x(E)',ox+2*s+4,oy); ctx.fillText('y(N)',ox+4,oy-2*s-8);
+  for (const o of scene?.scenario_objects || []) {           // 시나리오 정답 (Gazebo 배치)
+    const [a,b]=W2C(o.x,o.y); const r = o.type==='vehicle'?1.1*s: o.type==='person'?0.35*s:Math.max(4,0.2*s);
+    ctx.fillStyle = OBJ[o.type]||'#fff'; ctx.globalAlpha = .85; ctx.beginPath(); ctx.arc(a,b,r,0,7); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.fillStyle='#e6e9ee'; ctx.fillText(o.id, a+r+4, b);
+  }
+  for (const o of scene?.fod || []) {                        // AI 인식 결과 (월드 좌표)
+    if (!o.position_m) continue; const [a,b]=W2C(o.position_m.x,o.position_m.y);
+    ctx.strokeStyle='#a371f7'; ctx.lineWidth=2; ctx.strokeRect(a-7,b-7,14,14);
+  }
+  ctx.strokeStyle='rgba(88,166,255,.5)'; ctx.lineWidth=2; ctx.beginPath();
+  trail.forEach(([x,y],i)=>{ const [a,b]=W2C(x,y); i?ctx.lineTo(a,b):ctx.moveTo(a,b); }); ctx.stroke();
+  if (tel) {
+    if (tel.ext?.target) { const [a,b]=W2C(tel.ext.target.x,tel.ext.target.y); ctx.strokeStyle='#58a6ff'; ctx.setLineDash([4,4]); ctx.beginPath(); ctx.arc(a,b,8*devicePixelRatio,0,7); ctx.stroke(); ctx.setLineDash([]); }
+    const [a,b]=W2C(tel.x, tel.y); const yaw = (tel.yaw ?? 0) * Math.PI/180, L = 0.7*s+6;
+    ctx.save(); ctx.translate(a,b); ctx.rotate(-yaw);
+    ctx.fillStyle = '#58a6ff'; ctx.beginPath(); ctx.moveTo(L,0); ctx.lineTo(-L*0.6,L*0.55); ctx.lineTo(-L*0.3,0); ctx.lineTo(-L*0.6,-L*0.55); ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle='#e6e9ee'; ctx.fillText(`z=${f(tel.z,1)} m`, a+L+4, b-L);
+  }
+  ctx.fillStyle='#8b95a3'; ctx.fillText('● 시나리오 객체(정답)   □ AI 인식 FOD   + AI 인식 패드', 12*devicePixelRatio, cv.height-14*devicePixelRatio);
+  requestAnimationFrame(draw);
+}
+draw(); start();
+</script>
+</body>
+</html>

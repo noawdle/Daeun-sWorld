@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sdf version="1.9">
+  <!-- 착륙패드 3 m x 3 m. 충돌은 ground_plane 이 담당 (visual only).
+       노란 삼각형 표식으로 텍스처 방향을 확인할 수 있음 (Gazebo 화면에서 확인).
+       실제 패드 사진(정사각, 위에서 본 모습)으로
+       materials/textures/pad.png 를 교체하면 AI 학습 도메인과 맞출 수 있음. -->
+  <model name="vp_pad">
+    <static>true</static>
+    <link name="base">
+      <visual name="pad_visual">
+        <pose>0 0 0.003 0 0 0</pose>
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>3 3</size>
+          </plane>
+        </geometry>
+        <material>
+          <diffuse>1 1 1 1</diffuse>
+          <specular>0.2 0.2 0.2 1</specular>
+          <pbr>
+            <metal>
+              <albedo_map>model://vp_pad/materials/textures/pad.png</albedo_map>
+              <roughness>0.9</roughness>
+              <metalness>0.0</metalness>
+            </metal>
+          </pbr>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
