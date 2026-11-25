@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sdf version="1.9">
+  <!-- 단순 차량 모델. 모델 원점 = 차량 바닥 중심, +x = 차량 앞 -->
+  <model name="vp_vehicle">
+    <static>true</static>
+    <link name="body">
+      <collision name="col">
+        <pose>0 0 0.75 0 0 0</pose>
+        <geometry><box><size>4.4 1.8 1.5</size></box></geometry>
+      </collision>
+      <visual name="lower">
+        <pose>0 0 0.6 0 0 0</pose>
+        <geometry><box><size>4.4 1.8 0.6</size></box></geometry>
+        <material><ambient>0.95 0.95 0.95 1</ambient><diffuse>0.95 0.95 0.95 1</diffuse><specular>0.6 0.6 0.6 1</specular></material>
+      </visual>
+      <visual name="cabin">
+        <pose>-0.3 0 1.15 0 0 0</pose>
+        <geometry><box><size>2.4 1.6 0.6</size></box></geometry>
+        <material><ambient>0.2 0.3 0.45 1</ambient><diffuse>0.2 0.3 0.45 1</diffuse><specular>0.8 0.8 0.8 1</specular></material>
+      </visual>
+      <visual name="stripe">
+        <pose>0 0 0.91 0 0 0</pose>
+        <geometry><box><size>4.42 1.82 0.04</size></box></geometry>
+        <material><ambient>1.0 0.55 0.0 1</ambient><diffuse>1.0 0.55 0.0 1</diffuse></material>
+      </visual>
+      <visual name="wheel_0">
+        <pose>1.35 0.85 0.33 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.33</radius><length>0.22</length></cylinder></geometry>
+        <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.05 0.05 0.05 1</diffuse></material>
+      </visual>
+      <visual name="wheel_1">
+        <pose>1.35 -0.85 0.33 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.33</radius><length>0.22</length></cylinder></geometry>
+        <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.05 0.05 0.05 1</diffuse></material>
+      </visual>
+      <visual name="wheel_2">
+        <pose>-1.35 0.85 0.33 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.33</radius><length>0.22</length></cylinder></geometry>
+        <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.05 0.05 0.05 1</diffuse></material>
+      </visual>
+      <visual name="wheel_3">
+        <pose>-1.35 -0.85 0.33 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.33</radius><length>0.22</length></cylinder></geometry>
+        <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.05 0.05 0.05 1</diffuse></material>
+      </visual>
+    </link>
+  </model>
+</sdf>
