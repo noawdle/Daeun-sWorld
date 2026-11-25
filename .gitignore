@@ -5,3 +5,8 @@ __pycache__/
 !/vertiport_dashboard/data/fod_snapshots/README.md
 /vertiport_dashboard/data/fod_gallery_hidden.json
 /vertiport_dashboard/data/.fod_gallery_hidden-*.tmp
+
+# Local Python environments and AI test outputs
+.venv/
+.venv311/
+ai_test/
